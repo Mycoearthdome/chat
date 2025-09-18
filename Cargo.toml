@@ -1,0 +1,22 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.99"
+base32 = "0.5.1"
+clap = { version = "4.5.47", features = ["derive"] }
+indicatif = "0.18.0"
+rand = "0.8"
+sha1 = "0.10.6"
+socket2 = "0.6.0"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = "0.7.16"
+tokio-utils = "0.1.2"
+totp-rs = "5.7.0"
+
+[[bin]]
+name = "chat"
+path = "src/main.rs"
+
