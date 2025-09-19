@@ -34,11 +34,7 @@ The project uses the following Rust crates:
 1. Ensure Rust is installed: [Install Rust](https://www.rust-lang.org/tools/install)
 2. Clone the repository:
 
-```bash
-git clone https://github.com/yourusername/rust-udp-chat.git
-cd rust-udp-chat
-
-    Build the project:
+Build the project:
 
 cargo build --release
 
