@@ -50,8 +50,12 @@ struct FileBuffer {
 
 #[derive(Clone, Debug)]
 enum ChatLine {
-    Message(String),
+    Message {
+        ts: chrono::DateTime<Local>,
+        msg: String,
+    },
     Transfer {
+        ts: chrono::DateTime<Local>,
         filename: String,
         id: u32,
         done: u64,
@@ -63,7 +67,7 @@ enum ChatLine {
 impl std::fmt::Display for ChatLine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChatLine::Message(msg) => write!(f, "{}", msg),
+            ChatLine::Message { msg, .. } => write!(f, "{}", msg),
             ChatLine::Transfer { filename, done, total, .. } => {
                 if filename.len() > 20 {
                     write!(f, "[T] {}… {}/{}", &filename[..20], done, total)
@@ -76,10 +80,10 @@ impl std::fmt::Display for ChatLine {
 }
 
 impl From<String> for ChatLine {
-    fn from(s: String) -> Self { ChatLine::Message(s) }
+    fn from(s: String) -> Self { ChatLine::Message { ts: Local::now(), msg: s } }
 }
 impl From<&str> for ChatLine {
-    fn from(s: &str) -> Self { ChatLine::Message(s.to_string()) }
+    fn from(s: &str) -> Self { ChatLine::Message { ts: Local::now(), msg: s.to_string() } }
 }
 
 // -------------------- CLI --------------------
@@ -195,8 +199,11 @@ async fn terminal_loop(
                 // CHAT
                 { let chat_lock = chat.lock().await;
                   for entry in chat_lock.iter() {
-                      let ts = Local::now().format("[%H:%M:%S]").to_string();
-                      lines.push(format!("{} {}", ts, entry.to_string()));
+                      let ts = match entry {
+                          ChatLine::Message { ts, .. } => ts,
+                          ChatLine::Transfer { ts, .. } => ts,
+                      };
+                      lines.push(format!("[{}] {}", ts.format("%H:%M:%S"), entry.to_string()));
                   }
                 }
 
@@ -208,19 +215,19 @@ async fn terminal_loop(
 
                     for (filename, &(done, total, direction)) in ft_lock.iter() {
                         if done >= total {
-                            to_remove.push(filename.clone()); // mark completed transfers for removal
+                            to_remove.push(filename.clone());
                         } else {
                             last_file_snapshot.push((filename.clone(), done, total, direction));
                         }
                     }
 
-                    // remove completed transfers so they won't render
                     for fname in to_remove {
                         ft_lock.remove(&fname);
                     }
 
                     last_progress_update = Instant::now();
                 }
+
                 // SCROLL
                 let total_lines = lines.len();
                 let max_scroll = total_lines.saturating_sub(visible_rows);
@@ -257,10 +264,9 @@ async fn terminal_loop(
                                     input_buffer.clear();
                                     user_scrolled = false;
 
-                                    // Check if it's a file send command
                                     if input.starts_with("/send ") {
                                         if let Some(path) = input.strip_prefix("/send ") {
-                                            let path_owned = path.to_string(); // move owned String into async block
+                                            let path_owned = path.to_string();
                                             if let Some(target) = *last_client.lock().await {
                                                 let socket_clone = socket.clone();
                                                 let ack_clone = ack_map.clone();
@@ -291,10 +297,9 @@ async fn terminal_loop(
                                             }
                                         }
                                     } else {
-                                        // Normal chat message
                                         if let Some(target) = *last_client.lock().await {
                                             let _ = send_chat_message(socket.clone(), target, &input).await;
-                                            chat.lock().await.push(ChatLine::Message(format!("You: {}", input)));
+                                            chat.lock().await.push(ChatLine::Message { ts: Local::now(), msg: format!("You: {}", input) });
                                         }
                                     }
                                 }
@@ -314,8 +319,6 @@ async fn terminal_loop(
         }
     }
 }
-
-
 
 // -------------------- FILE CHUNK HANDLING --------------------
 async fn handle_file_chunk(
@@ -366,11 +369,9 @@ async fn handle_file_chunk(
         let done = entry.chunks.len() as u64;
         let total = entry.expected_chunks.unwrap_or(1) as u64;
 
-        // update FileTransfers for terminal rendering
         let mut ft = file_transfers.lock().await;
         ft.insert(fname.clone(), (done, total, TransferDirection::Download));
 
-        // also update chat entry
         let mut c = chat.lock().await;
         if let Some(pos) = c.iter_mut().rposition(|line| match line {
             ChatLine::Transfer { filename, id, .. } => filename == fname && *id == file_id,
@@ -381,7 +382,14 @@ async fn handle_file_chunk(
                 *t = total;
             }
         } else {
-            c.push(ChatLine::Transfer { id: file_id, filename: fname.clone(), done, total, direction: TransferDirection::Download });
+            c.push(ChatLine::Transfer {
+                ts: Local::now(),
+                id: file_id,
+                filename: fname.clone(),
+                done,
+                total,
+                direction: TransferDirection::Download,
+            });
         }
     }
 
@@ -408,11 +416,10 @@ async fn handle_file_chunk(
             let mut counter = transfer_counter.lock().await;
             if *counter > 0 { *counter -= 1; }
 
-            chat.lock().await.push(ChatLine::Message(format!("Saved received file '{}' from {}", filename, src)));
+            chat.lock().await.push(ChatLine::Message { ts: Local::now(), msg: format!("Saved received file '{}' from {}", filename, src) });
         }
     }
 
-    // update last_client
     *last_client.lock().await = Some(src);
 }
 
@@ -425,7 +432,7 @@ async fn send_file(
     file_id: u32,
     transfer_counter: TransferCounter,
     chat: ChatHistory,
-    file_transfers: FileTransfers, // added
+    file_transfers: FileTransfers,
 ) -> Result<()> {
     let mut file = tokio::fs::File::open(&path).await?;
     let metadata = tokio::fs::metadata(&path).await?;
@@ -438,22 +445,30 @@ async fn send_file(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or("unknown_file".to_string());
 
-    let total_chunks = ((file_size + buffer_size as u64 -1)/buffer_size as u64) as u32;
+    let total_chunks = ((file_size + buffer_size as u64 - 1)/buffer_size as u64) as u32;
 
     {
         let mut counter = transfer_counter.lock().await;
-        *counter +=1;
+        *counter += 1;
     }
 
     // initialize progress
     file_transfers.lock().await.insert(filename.clone(), (0, total_chunks as u64, TransferDirection::Upload));
-    chat.lock().await.push(ChatLine::Transfer { id: file_id, filename: filename.clone(), done: 0, total: total_chunks as u64, direction: TransferDirection::Upload });
+    chat.lock().await.push(ChatLine::Transfer {
+        ts: Local::now(),
+        id: file_id,
+        filename: filename.clone(),
+        done: 0,
+        total: total_chunks as u64,
+        direction: TransferDirection::Upload,
+    });
 
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     let mut chunk_index: u32 = 0;
     loop {
         let n = file.read(&mut buffer).await?;
         if n == 0 { break; }
+
         let mut packet = Vec::with_capacity(n + 512);
         packet.extend_from_slice(&file_id.to_be_bytes());
         packet.extend_from_slice(&chunk_index.to_be_bytes());
@@ -489,12 +504,15 @@ async fn send_file(
             while sent_index < chunks.len() && map.remove(&(file_id, sent_index as u32)).is_some() {
                 // update progress
                 let mut ft = file_transfers.lock().await;
-                if let Some((done, total, dir)) = ft.get_mut(&filename) {
+                if let Some((done, _, _)) = ft.get_mut(&filename) {
                     *done += 1;
                 }
 
                 let mut c = chat.lock().await;
-                if let Some(pos) = c.iter_mut().rposition(|line| match line { ChatLine::Transfer { id, .. } => *id == file_id, _ => false }) {
+                if let Some(pos) = c.iter_mut().rposition(|line| match line {
+                    ChatLine::Transfer { id, .. } => *id == file_id,
+                    _ => false,
+                }) {
                     if let ChatLine::Transfer { done: d, .. } = &mut c[pos] {
                         *d += 1;
                     }
@@ -520,12 +538,11 @@ async fn send_file(
     // finish
     let mut counter = transfer_counter.lock().await;
     if *counter > 0 { *counter -=1; }
-    chat.lock().await.push(ChatLine::Message(format!("Finished sending '{}'", filename)));
+    chat.lock().await.push(ChatLine::Message { ts: Local::now(), msg: format!("Finished sending '{}'", filename) });
     file_transfers.lock().await.remove(&filename);
 
     Ok(())
 }
-
 
 // -------------------- RECEIVER --------------------
 fn spawn_receiver(
@@ -544,17 +561,14 @@ fn spawn_receiver(
             match socket.recv_from(&mut buf).await {
                 Ok((len, src)) => {
                     if len >= 3 && &buf[..3] == MSG_PREFIX {
-                        // Regular chat message
                         let msg = String::from_utf8_lossy(&buf[3..len]).to_string();
-                        chat.lock().await.push(ChatLine::Message(format!("{} says: {}", src, msg)));
+                        chat.lock().await.push(ChatLine::Message { ts: Local::now(), msg: format!("{} says: {}", src, msg) });
                         *last_client.lock().await = Some(src);
                     } else if len >= 11 && &buf[..3] == ACK_PREFIX {
-                        // ACK for file chunk
                         let file_id = u32::from_be_bytes(buf[3..7].try_into().unwrap());
                         let chunk_index = u32::from_be_bytes(buf[7..11].try_into().unwrap());
                         ack_map.lock().await.insert((file_id, chunk_index), true);
                     } else if len >= 9 {
-                        // File transfer chunk
                         handle_file_chunk(
                             &buf,
                             len,
@@ -565,8 +579,7 @@ fn spawn_receiver(
                             chat.clone(),
                             last_client.clone(),
                             file_transfers.clone(),
-                        )
-                        .await;
+                        ).await;
                     }
                 }
                 Err(_) => sleep(Duration::from_millis(50)).await,
@@ -589,7 +602,6 @@ async fn run_server(cli: Cli) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind(("0.0.0.0", current_port)).await?);
     println!("Server listening on port {}", current_port);
 
-    // Terminal + input loop
     {
         let chat_clone = chat_history.clone();
         let socket_clone = socket.clone();
@@ -606,8 +618,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 ack_clone,
                 counter_clone,
                 transfers_clone,
-            )
-            .await;
+            ).await;
         });
     }
 
@@ -620,39 +631,6 @@ async fn run_server(cli: Cli) -> Result<()> {
         last_client.clone(),
         file_transfers.clone(),
     );
-
-    // Server port rotation
-    {
-        let secret_bytes = secret_bytes.clone();
-        let chat_clone = chat_history.clone();
-        let files_clone = files.clone();
-        let ack_clone = ack_map.clone();
-        let transfer_clone = transfer_counter.clone();
-        let last_clone = last_client.clone();
-        let transfers_clone = file_transfers.clone();
-
-        tokio::spawn(async move {
-            let mut current_port = current_port;
-            loop {
-                sleep(Duration::from_secs(10)).await;
-                let new_port = compute_port(&secret_bytes, cli.base_port, cli.port_range);
-                if new_port != current_port {
-                    println!("Rotating port {} -> {}", current_port, new_port);
-                    current_port = new_port;
-                    let new_socket = Arc::new(UdpSocket::bind(("0.0.0.0", new_port)).await.unwrap());
-                    spawn_receiver(
-                        new_socket,
-                        chat_clone.clone(),
-                        files_clone.clone(),
-                        ack_clone.clone(),
-                        transfer_clone.clone(),
-                        last_clone.clone(),
-                        transfers_clone.clone(),
-                    );
-                }
-            }
-        });
-    }
 
     future::pending::<()>().await;
     Ok(())
@@ -675,7 +653,6 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
     println!("Client bound to {}", socket.local_addr()?);
 
-    // Terminal loop
     {
         let chat_clone = chat_history.clone();
         let socket_clone = socket.clone();
@@ -693,8 +670,7 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
                 ack_clone,
                 counter_clone,
                 transfers_clone,
-            )
-            .await;
+            ).await;
         });
     }
 
@@ -708,30 +684,9 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         file_transfers.clone(),
     );
 
-    // Monitor server port rotation
-    {
-        let server_addr_clone = server_addr.clone();
-        let secret_bytes = secret_bytes.clone();
-        let server_clone = server.clone();
-
-        tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(10)).await;
-                let new_port = compute_port(&secret_bytes, cli.base_port, cli.port_range);
-                let new_addr: SocketAddr = format!("{}:{}", server_clone, new_port).parse().unwrap();
-                let mut addr_lock = server_addr_clone.lock().await;
-                if *addr_lock != Some(new_addr) {
-                    println!("Server port changed: {:?} -> {:?}", *addr_lock, new_addr);
-                    *addr_lock = Some(new_addr);
-                }
-            }
-        });
-    }
-
     future::pending::<()>().await;
     Ok(())
 }
-
 
 // -------------------- MAIN --------------------
 #[tokio::main]
@@ -743,3 +698,5 @@ async fn main() -> Result<()> {
     }
     Ok(())
 }
+
+
