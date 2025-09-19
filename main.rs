@@ -598,9 +598,11 @@ async fn run_server(cli: Cli) -> Result<()> {
     let last_client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
 
     let secret_bytes = secret_to_bytes(&cli.secret);
-    let current_port = compute_port(&secret_bytes, cli.base_port, cli.port_range);
-    let socket = Arc::new(UdpSocket::bind(("0.0.0.0", current_port)).await?);
-    println!("Server listening on port {}", current_port);
+
+    // Start terminal loop once on the first socket
+    let initial_port = compute_port(&secret_bytes, cli.base_port, cli.port_range);
+    let mut socket = Arc::new(UdpSocket::bind(("0.0.0.0", initial_port)).await?);
+    println!("Server listening on port {}", initial_port);
 
     {
         let chat_clone = chat_history.clone();
@@ -632,8 +634,33 @@ async fn run_server(cli: Cli) -> Result<()> {
         file_transfers.clone(),
     );
 
-    future::pending::<()>().await;
-    Ok(())
+    let mut current_port = initial_port;
+
+    // -------------------- PORT ROTATION LOOP --------------------
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await; // rotate every 60s
+
+        let new_port = compute_port(&secret_bytes, cli.base_port, cli.port_range);
+        if new_port != current_port {
+            println!("Rotating server port: {} -> {}", current_port, new_port);
+            let new_socket = Arc::new(UdpSocket::bind(("0.0.0.0", new_port)).await?);
+
+            // Replace old socket with new
+            socket = new_socket.clone();
+            current_port = new_port;
+
+            // Spawn receiver on new socket
+            spawn_receiver(
+                socket.clone(),
+                chat_history.clone(),
+                files.clone(),
+                ack_map.clone(),
+                transfer_counter.clone(),
+                last_client.clone(),
+                file_transfers.clone(),
+            );
+        }
+    }
 }
 
 // -------------------- CLIENT LOOP --------------------
