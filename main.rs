@@ -517,30 +517,25 @@ async fn redraw_terminal(
     // --- Chat messages ---
     for entry in chat_lines {
         let ts = match entry {
-            ChatLine::Message { ts, ..
-} | ChatLine::Transfer { ts, ..
-} => ts,
-       
-};
-        lines.push(format!("[{
-}] {
-}", ts.format("%H:%M:%S"), entry));
-   
-}
+            ChatLine::Message { ts, .. } | ChatLine::Transfer { ts, .. } => ts,
+        };
+        lines.push(format!("[{}] {}", ts.format("%H:%M:%S"), entry));
+    }
 
     // --- File transfers ---
     let ft_snapshot = {
         let file_transfers_clone = file_transfers.clone();
         let ft_lock = file_transfers_clone.lock().await;
         ft_lock.clone() // clone the hashmap
-   
-};
-
+    };
 
     for (fname, &(done, total, direction, state)) in ft_snapshot.iter() {
-        let percent = if total > 0 { (done as f64 / total as f64 * 100.0).round() as u64
-} else { 0
-};
+        let percent = if total > 0 {
+            (done as f64 / total as f64 * 100.0).round() as u64
+        } else {
+            0
+        };
+
         let bar_width = (cols as usize).saturating_sub(30);
         let filled = ((percent as usize * bar_width) / 100).min(bar_width);
         let mut bar = String::new();
@@ -553,23 +548,15 @@ async fn redraw_terminal(
             (_, TransferState::Done) => match direction {
                 TransferDirection::Upload => Color::Blue,
                 TransferDirection::Download => Color::Green,
-           
-},
+            },
             (_, TransferState::Failed) => Color::Red,
-       
-};
+        };
 
         let status = match state {
-            TransferState::InProgress => format!("[{
-}] {
-}% {
-}", bar, percent, fname),
-            TransferState::Done => format!("[{
-} - DONE]", fname),
-            TransferState::Failed => format!("[{
-} - FAILED]", fname),
-       
-};
+            TransferState::InProgress => format!("[{}] {}% {}", bar, percent, fname),
+            TransferState::Done => format!("[{} - DONE]", fname),
+            TransferState::Failed => format!("[{} - FAILED]", fname),
+        };
 
         let _ = execute!(
             stdout,
@@ -581,8 +568,7 @@ async fn redraw_terminal(
         );
 
         lines.push(status);
-   
-}
+    }
 
     // --- Draw visible lines ---
     let start_idx = calculate_start_index(lines.len(), visible_rows, scroll_offset);
@@ -595,26 +581,19 @@ async fn redraw_terminal(
             Print(line.chars().take(cols as usize).collect::<String>()),
             ResetColor
         );
-   
-}
+    }
 
     // Clear remaining lines
     for i in lines.len()..visible_rows {
         let _ = execute!(stdout, cursor::MoveTo(0, i as u16), Clear(ClearType::CurrentLine));
-   
-}
+    }
 
     // --- Draw prompt ---
     let prompt = if search_mode {
-        format!("(reverse-i-search)`{
-}': {
-}", search_buffer, input_buffer)
-   
-} else {
-        format!("> {
-}", input_buffer)
-   
-};
+        format!("(reverse-i-search)`{}': {}", search_buffer, input_buffer)
+    } else {
+        format!("> {}", input_buffer)
+    };
 
     let _ = execute!(
         stdout,
@@ -627,8 +606,8 @@ async fn redraw_terminal(
     );
 
     let _ = stdout.flush();
-
 }
+
 
 async fn redraw(
     stdout: &mut std::io::Stdout,
@@ -848,6 +827,7 @@ pub async fn file_manager_task(
     let state: Arc<Mutex<HashMap<u32, FileState>>> = Arc::new(Mutex::new(HashMap::new()));
     let completed_files = Arc::new(Mutex::new(HashSet::new()));
 
+    /*
     // === Stale transfer cleanup ===
     {
         let state = state.clone();
@@ -921,7 +901,7 @@ pub async fn file_manager_task(
                 }
             }
         });
-    }
+    }*/
 
     let mut last_redraw = Instant::now();
 
@@ -980,7 +960,7 @@ pub async fn file_manager_task(
             let done = entry.chunks.len() as u64;
             let total = entry.total_chunks.unwrap_or(done as u32) as u64;
 
-            let _ = chat_tx
+            /*let _ = chat_tx
                 .send(ChatLine::Transfer {
                     ts: Local::now(),
                     id: chunk.file_id,
@@ -992,7 +972,7 @@ pub async fn file_manager_task(
                 })
                 .await;
 
-            redraw_notify.notify_one();
+            redraw_notify.notify_one();*/
             last_redraw = Instant::now();
         }
 
