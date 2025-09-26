@@ -36,17 +36,15 @@ use rand::rngs::ThreadRng;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-
-
 // -------------------- CONSTANTS --------------------
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
-const ACK_TIMEOUT_MS: u64 = 200;
+const ACK_TIMEOUT_MS: u64 = 5000;
 const MAX_RETRIES: usize = 5;
 const HISTORY_LIMIT: usize = 500;
-const RECEIVE_TIMEOUT_MS: u64 =  1000 * 600;
-const PORT_ROTATION_DELAY: u64 = 60; // secs
+const RECEIVE_TIMEOUT_MS: u64 =  10000;
+const PORT_ROTATION_DELAY: u64 = 180; // secs
 static mut window_size:usize = MAX_UDP_PAYLOAD / 2;
 
 // -------------------- TYPES --------------------
@@ -61,17 +59,19 @@ pub type ChunkCache = Arc<Mutex<HashMap<u32, HashMap<u32, FileChunk>>>>;
 
 
 #[derive(Clone, Copy, Debug)]
-enum TransferDirection { Upload, Download }
+enum TransferDirection { Upload, Download
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TransferState { InProgress, Done, Failed }
+enum TransferState { InProgress, Done, Failed
+}
 
 #[derive(Clone, Debug)]
 pub enum ChatLine {
     Message {
         ts: chrono::DateTime<Local>,
         msg: String,
-    },
+},
     Transfer {
         ts: chrono::DateTime<Local>,
         id: u32,
@@ -80,18 +80,21 @@ pub enum ChatLine {
         total: u64,
         direction: TransferDirection,
         state: TransferState,
-    },
+   
+},
+
 }
 
 #[derive(Debug)]
 pub struct FileProgress {
     pub pb: ProgressBar,
     pub total_chunks: u32,
+
 }
 
 impl FileProgress {
-    pub fn new(name: &str, total_chunks: u32) -> Self {
-        let pb = ProgressBar::new(total_chunks as u64);
+    pub fn new(name: &str, total_chunks: u32, multi: &MultiProgress) -> Self {
+        let pb = multi.add(ProgressBar::new(total_chunks as u64));
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
@@ -182,17 +185,21 @@ impl Default for FileAck {
     }
 }
 
+
 /// Helper to render progress bars
 fn render_progress(done: u64, total: u64, width: usize) -> String {
     if total == 0 {
         return String::new();
     }
+
     let ratio = done as f64 / total as f64;
     let filled = (ratio * width as f64).round() as usize;
     let filled = filled.min(width);
     let bar = "#".repeat(filled) + &".".repeat(width - filled);
+
     format!("[{}] {}/{}", bar, done, total)
 }
+
 
 impl fmt::Display for ChatLine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -200,6 +207,7 @@ impl fmt::Display for ChatLine {
             ChatLine::Message { ts, msg } => {
                 write!(f, "[{}] {}", ts.format("%H:%M:%S"), msg)
             }
+
             ChatLine::Transfer {
                 ts,
                 filename,
@@ -213,12 +221,15 @@ impl fmt::Display for ChatLine {
                     TransferDirection::Upload => "↑",
                     TransferDirection::Download => "↓",
                 };
+
                 let st = match state {
                     TransferState::InProgress => "…",
                     TransferState::Done => "✔",
                     TransferState::Failed => "✘",
                 };
+
                 let bar = render_progress(*done, *total, 20);
+
                 write!(
                     f,
                     "[{}] {} {} {} {}",
@@ -233,6 +244,7 @@ impl fmt::Display for ChatLine {
     }
 }
 
+
 // Shared progress map: file_id → progress bar & total chunks
 type FileProgressMap = Arc<Mutex<HashMap<u32, FileProgress>>>;
 
@@ -244,6 +256,7 @@ struct FileState {
     total_chunks: Option<u32>,
     chunks: BTreeMap<u32, Vec<u8>>,
     last_seen: Instant,
+
 }
 
 // Message representing a received chunk to be processed by the file manager.
@@ -255,6 +268,7 @@ struct FileChunk {
     filename: Option<String>,
     payload: Vec<u8>,
     src: Option<SocketAddr>,
+
 }
 
 impl FileChunk {
@@ -267,20 +281,25 @@ impl FileChunk {
             if let Some(name) = &self.filename {
                 buf.push(name.len() as u8);
                 buf.extend_from_slice(name.as_bytes());
-            }
+           
+}
             if let Some(total) = self.total_chunks {
                 buf.extend_from_slice(&total.to_be_bytes());
-            }
-        }
+           
+}
+       
+}
 
         buf.extend_from_slice(&self.payload);
         buf
-    }
+   
+}
 
     pub fn from_bytes(buf: &[u8], src: SocketAddr) -> Option<Self> {
         if buf.len() < 8 {
             return None;
-        }
+       
+}
 
         let file_id = u32::from_be_bytes(buf[0..4].try_into().ok()?);
         let chunk_index = u32::from_be_bytes(buf[4..8].try_into().ok()?);
@@ -298,12 +317,15 @@ impl FileChunk {
                 offset += name_len;
                 total_chunks = Some(u32::from_be_bytes(buf[offset..offset + 4].try_into().ok()?));
                 offset += 4;
-            }
-        }
+           
+}
+       
+}
 
         if offset > buf.len() {
             return None;
-        }
+       
+}
 
         let payload = buf[offset..].to_vec();
 
@@ -314,14 +336,18 @@ impl FileChunk {
             filename,
             payload,
             src: Some(src),
-        })
-    }
+       
+})
+   
+}
+
 }
     
 #[derive(Debug)]
 struct AckMessage {
     file_id: u32,
     chunk_index: u32,
+
 }
 
 impl AckMessage {
@@ -331,7 +357,9 @@ impl AckMessage {
         buf.extend_from_slice(&self.file_id.to_be_bytes());
         buf.extend_from_slice(&self.chunk_index.to_be_bytes());
         buf
-    }
+   
+}
+
 }
 
 // -------------------- TERMINAL ARGs --------------------
@@ -347,12 +375,15 @@ struct TerminalArgs {
     pub ack_tracker: FileAckTracker,
     pub ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
     pub progress_map: Arc<Mutex<HashMap<u32, FileProgress>>>,
+
 }
 
 async fn chat_push_cap(chat: &ChatHistory, line: ChatLine) {
     let mut c = chat.lock().await; // lock the mutex
-    if c.len() >= HISTORY_LIMIT { c.remove(0); }
+    if c.len() >= HISTORY_LIMIT { c.remove(0);
+}
     c.push(line);
+
 }
 
 // -------------------- CLI --------------------
@@ -366,12 +397,15 @@ struct Cli {
     port_range: u16,
     #[arg(short, long)]
     secret: String,
+
 }
 
 #[derive(Subcommand, Clone)]
 enum Role {
     Server,
-    Client { #[arg(short, long, default_value = "127.0.0.1")] server: String },
+    Client { #[arg(short, long, default_value = "127.0.0.1")] server: String
+},
+
 }
 
 // -------------------- UTILS --------------------
@@ -379,6 +413,7 @@ fn secret_to_bytes(secret: &str) -> Vec<u8> {
     let mut hasher = Sha1::new();
     hasher.update(secret.as_bytes());
     hasher.finalize().to_vec()
+
 }
 
 fn compute_port(secret_bytes: &[u8], base_port: u16, port_range: u16) -> u16 {
@@ -396,6 +431,7 @@ fn compute_port(secret_bytes: &[u8], base_port: u16, port_range: u16) -> u16 {
     let val = u32::from_be_bytes(slice);
 
     base_port + (val % port_range as u32) as u16
+
 }
 
 fn compute_possible_ports(secret_bytes: &[u8], base_port: u16, port_range: u16) -> Vec<u16> {
@@ -414,20 +450,26 @@ fn compute_possible_ports(secret_bytes: &[u8], base_port: u16, port_range: u16) 
         let slice: [u8; 4] = digest[16..20].try_into().unwrap();
         let val = u32::from_be_bytes(slice);
         base_port + (val % port_range as u32) as u16
-    }).collect()
+   
+}).collect()
+
 }
 
 // -------------------- TERMINAL --------------------
 struct TerminalGuard;
 impl TerminalGuard {
-    fn new() -> Self { enable_raw_mode().unwrap(); TerminalGuard }
+    fn new() -> Self { enable_raw_mode().unwrap(); TerminalGuard
+}
+
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         disable_raw_mode().unwrap();
         let mut stdout = stdout();
         let _ = execute!(stdout, Clear(ClearType::All), cursor::MoveTo(0,0));
-    }
+   
+}
+
 }
 
 // -------------------- SEND CHAT MESSAGE --------------------
@@ -441,16 +483,20 @@ async fn send_chat_message_to_target(
     buf.extend_from_slice(msg.as_bytes());
     socket.send_to(&buf, target).await?;
     Ok(())
+
 }
 
 // -------------------- HELPERS & REDRAW --------------------
 fn calculate_start_index(total_lines: usize, visible_rows: usize, scroll_offset: usize) -> usize {
     if total_lines <= visible_rows {
         0
-    } else {
+   
+} else {
         let max_offset = total_lines - visible_rows;
         total_lines - visible_rows - scroll_offset.min(max_offset)
-    }
+   
+}
+
 }
 
 async fn redraw_terminal(
@@ -471,21 +517,30 @@ async fn redraw_terminal(
     // --- Chat messages ---
     for entry in chat_lines {
         let ts = match entry {
-            ChatLine::Message { ts, .. } | ChatLine::Transfer { ts, .. } => ts,
-        };
-        lines.push(format!("[{}] {}", ts.format("%H:%M:%S"), entry));
-    }
+            ChatLine::Message { ts, ..
+} | ChatLine::Transfer { ts, ..
+} => ts,
+       
+};
+        lines.push(format!("[{
+}] {
+}", ts.format("%H:%M:%S"), entry));
+   
+}
 
     // --- File transfers ---
     let ft_snapshot = {
         let file_transfers_clone = file_transfers.clone();
         let ft_lock = file_transfers_clone.lock().await;
         ft_lock.clone() // clone the hashmap
-    };
+   
+};
 
 
     for (fname, &(done, total, direction, state)) in ft_snapshot.iter() {
-        let percent = if total > 0 { (done as f64 / total as f64 * 100.0).round() as u64 } else { 0 };
+        let percent = if total > 0 { (done as f64 / total as f64 * 100.0).round() as u64
+} else { 0
+};
         let bar_width = (cols as usize).saturating_sub(30);
         let filled = ((percent as usize * bar_width) / 100).min(bar_width);
         let mut bar = String::new();
@@ -498,15 +553,23 @@ async fn redraw_terminal(
             (_, TransferState::Done) => match direction {
                 TransferDirection::Upload => Color::Blue,
                 TransferDirection::Download => Color::Green,
-            },
+           
+},
             (_, TransferState::Failed) => Color::Red,
-        };
+       
+};
 
         let status = match state {
-            TransferState::InProgress => format!("[{}] {}% {}", bar, percent, fname),
-            TransferState::Done => format!("[{} - DONE]", fname),
-            TransferState::Failed => format!("[{} - FAILED]", fname),
-        };
+            TransferState::InProgress => format!("[{
+}] {
+}% {
+}", bar, percent, fname),
+            TransferState::Done => format!("[{
+} - DONE]", fname),
+            TransferState::Failed => format!("[{
+} - FAILED]", fname),
+       
+};
 
         let _ = execute!(
             stdout,
@@ -518,7 +581,8 @@ async fn redraw_terminal(
         );
 
         lines.push(status);
-    }
+   
+}
 
     // --- Draw visible lines ---
     let start_idx = calculate_start_index(lines.len(), visible_rows, scroll_offset);
@@ -531,19 +595,26 @@ async fn redraw_terminal(
             Print(line.chars().take(cols as usize).collect::<String>()),
             ResetColor
         );
-    }
+   
+}
 
     // Clear remaining lines
     for i in lines.len()..visible_rows {
         let _ = execute!(stdout, cursor::MoveTo(0, i as u16), Clear(ClearType::CurrentLine));
-    }
+   
+}
 
     // --- Draw prompt ---
     let prompt = if search_mode {
-        format!("(reverse-i-search)`{}': {}", search_buffer, input_buffer)
-    } else {
-        format!("> {}", input_buffer)
-    };
+        format!("(reverse-i-search)`{
+}': {
+}", search_buffer, input_buffer)
+   
+} else {
+        format!("> {
+}", input_buffer)
+   
+};
 
     let _ = execute!(
         stdout,
@@ -556,6 +627,7 @@ async fn redraw_terminal(
     );
 
     let _ = stdout.flush();
+
 }
 
 async fn redraw(
@@ -571,8 +643,10 @@ async fn redraw(
         let chat_clone = chat.clone();
         let chat_lock = chat_clone.lock().await;
         chat_lock.clone()
-    };
+   
+};
     redraw_terminal(stdout, &snapshot, file_transfers, input_buffer, search_mode, search_buffer, scroll_offset).await;
+
 }
 
 // -------------------- KEY HANDLING --------------------
@@ -603,7 +677,7 @@ async fn handle_key(
     redraw_notify_clone_for_send: Arc<Notify>,
     ack_tracker: FileAckTracker,
     ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
-    progress_map: Arc<Mutex<HashMap<u32, FileProgress>>>, 
+    progress_map: Arc<Mutex<HashMap<u32, FileProgress>>>,
 ) {
     match key_event.code {
         KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -611,10 +685,12 @@ async fn handle_key(
             *search_buffer = String::new();
             *search_result_index = None;
         }
+
         KeyCode::Char(c) => {
             if *search_mode {
                 search_buffer.push(c);
-                *search_result_index = history.iter().rposition(|entry| entry.contains(&*search_buffer));
+                *search_result_index =
+                    history.iter().rposition(|entry| entry.contains(&*search_buffer));
                 if let Some(idx) = *search_result_index {
                     *input_buffer = history[idx].clone();
                 }
@@ -623,10 +699,12 @@ async fn handle_key(
                 *history_index = None;
             }
         }
+
         KeyCode::Backspace => {
             if *search_mode {
                 search_buffer.pop();
-                *search_result_index = history.iter().rposition(|entry| entry.contains(&*search_buffer));
+                *search_result_index =
+                    history.iter().rposition(|entry| entry.contains(&*search_buffer));
                 if let Some(idx) = *search_result_index {
                     *input_buffer = history[idx].clone();
                 } else {
@@ -637,6 +715,7 @@ async fn handle_key(
                 *history_index = None;
             }
         }
+
         KeyCode::Enter => {
             if *search_mode {
                 *search_mode = false;
@@ -688,38 +767,65 @@ async fn handle_key(
                     for &addr in targets_lock.iter() {
                         let _ = send_chat_message_to_target(socket.clone(), addr, &input).await;
                     }
-                    chat_push_cap(chat, ChatLine::Message { ts: Local::now(), msg: format!("You: {}", input) }).await;
+                    chat_push_cap(
+                        chat,
+                        ChatLine::Message {
+                            ts: Local::now(),
+                            msg: format!("You: {}", input),
+                        },
+                    )
+                    .await;
                     redraw_notify.notify_one();
                 }
             }
         }
+
         KeyCode::Up => {
             if !*search_mode {
                 if let Some(idx) = history_index {
-                    if *idx > 0 { *idx -= 1; *input_buffer = history[*idx].clone(); }
+                    if *idx > 0 {
+                        *idx -= 1;
+                        *input_buffer = history[*idx].clone();
+                    }
                 } else if !history.is_empty() {
                     *history_index = Some(history.len() - 1);
                     *input_buffer = history.last().unwrap().clone();
                 }
             }
         }
+
         KeyCode::Down => {
             if !*search_mode {
                 if let Some(idx) = history_index {
-                    if *idx + 1 < history.len() { *idx += 1; *input_buffer = history[*idx].clone(); }
-                    else { *history_index = None; input_buffer.clear(); }
+                    if *idx + 1 < history.len() {
+                        *idx += 1;
+                        *input_buffer = history[*idx].clone();
+                    } else {
+                        *history_index = None;
+                        input_buffer.clear();
+                    }
                 }
             }
         }
-        KeyCode::PageUp => { *scroll_offset += visible_rows / 2; }
-        KeyCode::PageDown => { *scroll_offset = scroll_offset.saturating_sub(visible_rows / 2); }
+
+        KeyCode::PageUp => {
+            *scroll_offset += visible_rows / 2;
+        }
+
+        KeyCode::PageDown => {
+            *scroll_offset = scroll_offset.saturating_sub(visible_rows / 2);
+        }
+
         KeyCode::Esc => {
             if *search_mode {
                 *search_mode = false;
                 *search_buffer = String::new();
                 *search_result_index = None;
-            } else { input_buffer.clear(); }
+            } else {
+                input_buffer.clear();
+            }
         }
+
         _ => {}
     }
 
@@ -727,6 +833,7 @@ async fn handle_key(
         redraw_notify.notify_one();
     }
 }
+
 
 
 // ------------------- File Manager Task -------------------
@@ -774,23 +881,38 @@ pub async fn file_manager_task(
                         let total = entry.total_chunks.unwrap_or(done as u32) as u64;
 
                         let mut ft = file_transfers.lock().await;
-                        ft.insert(filename.clone(), (done, total, TransferDirection::Download, TransferState::Failed));
+                        ft.insert(
+                            filename.clone(),
+                            (
+                                done,
+                                total,
+                                TransferDirection::Download,
+                                TransferState::Failed,
+                            ),
+                        );
 
-                        let _ = chat_tx.send(ChatLine::Transfer {
-                            ts: Local::now(),
-                            id: fid,
-                            filename: filename.clone(),
-                            done,
-                            total,
-                            direction: TransferDirection::Download,
-                            state: TransferState::Failed,
-                        }).await;
+                        /*let _ = chat_tx
+                            .send(ChatLine::Transfer {
+                                ts: Local::now(),
+                                id: fid,
+                                filename: filename.clone(),
+                                done,
+                                total,
+                                direction: TransferDirection::Download,
+                                state: TransferState::Failed,
+                            })
+                            .await;
 
-                        let _ = chat_tx.send(ChatLine::Message {
-                            ts: Local::now(),
-                            msg: format!("Transfer {} timed out - marked as failed", fid),
-                        }).await;
-
+                        let _ = chat_tx
+                            .send(ChatLine::Message {
+                                ts: Local::now(),
+                                msg: format!(
+                                    "Transfer {} timed out - marked as failed",
+                                    fid
+                                ),
+                            })
+                            .await;
+                        */
                         redraw_notify_clone.notify_one();
 
                         let mut at = ack_tracker.lock().await;
@@ -858,15 +980,17 @@ pub async fn file_manager_task(
             let done = entry.chunks.len() as u64;
             let total = entry.total_chunks.unwrap_or(done as u32) as u64;
 
-            let _ = chat_tx.send(ChatLine::Transfer {
-                ts: Local::now(),
-                id: chunk.file_id,
-                filename: entry.filename.clone(),
-                done,
-                total,
-                direction: TransferDirection::Download,
-                state: TransferState::InProgress,
-            }).await;
+            let _ = chat_tx
+                .send(ChatLine::Transfer {
+                    ts: Local::now(),
+                    id: chunk.file_id,
+                    filename: entry.filename.clone(),
+                    done,
+                    total,
+                    direction: TransferDirection::Download,
+                    state: TransferState::InProgress,
+                })
+                .await;
 
             redraw_notify.notify_one();
             last_redraw = Instant::now();
@@ -898,25 +1022,39 @@ pub async fn file_manager_task(
 
                     // Update transfer info
                     let mut ft = file_transfers.lock().await;
-                    ft.insert(filename.clone(), (total as u64, total as u64, TransferDirection::Download, TransferState::Done));
+                    ft.insert(
+                        filename.clone(),
+                        (
+                            total as u64,
+                            total as u64,
+                            TransferDirection::Download,
+                            TransferState::Done,
+                        ),
+                    );
 
                     let mut ctr = transfer_counter.lock().await;
-                    if *ctr > 0 { *ctr -= 1; }
+                    if *ctr > 0 {
+                        *ctr -= 1;
+                    }
 
-                    let _ = chat_tx.send(ChatLine::Transfer {
-                        ts: Local::now(),
-                        id: chunk.file_id,
-                        filename: filename.clone(),
-                        done: total as u64,
-                        total: total as u64,
-                        direction: TransferDirection::Download,
-                        state: TransferState::Done,
-                    }).await;
+                    let _ = chat_tx
+                        .send(ChatLine::Transfer {
+                            ts: Local::now(),
+                            id: chunk.file_id,
+                            filename: filename.clone(),
+                            done: total as u64,
+                            total: total as u64,
+                            direction: TransferDirection::Download,
+                            state: TransferState::Done,
+                        })
+                        .await;
 
-                    let _ = chat_tx.send(ChatLine::Message {
-                        ts: Local::now(),
-                        msg: format!("Saved received file '{}'", filename),
-                    }).await;
+                    let _ = chat_tx
+                        .send(ChatLine::Message {
+                            ts: Local::now(),
+                            msg: format!("Saved received file '{}'", filename),
+                        })
+                        .await;
 
                     redraw_notify.notify_one();
                 });
@@ -924,7 +1062,6 @@ pub async fn file_manager_task(
         }
     }
 }
-
 
 pub fn spawn_progress_notifier(
     file_transfers: FileTransfers,
@@ -962,6 +1099,7 @@ pub fn spawn_progress_notifier(
     });
 }
 
+
 async fn forward_chunk_to_clients(
     chunk: &FileChunk,
     socket: &UdpSocket,
@@ -975,7 +1113,9 @@ async fn forward_chunk_to_clients(
     let entry = tracker_lock.entry(chunk.file_id).or_default();
 
     for &addr in &targets_snapshot {
-        if addr == src { continue; }
+        if addr == src {
+            continue;
+        }
 
         let sent_chunks = entry.entry(addr).or_default();
         if !sent_chunks.contains(&chunk.chunk_index) {
@@ -984,6 +1124,7 @@ async fn forward_chunk_to_clients(
         }
     }
 }
+
 
 // -------------------- SENDER: send_file uses broadcast receiver for ACKs --------------------
 pub async fn send_file(
@@ -1002,7 +1143,7 @@ pub async fn send_file(
     let filename = Path::new(&path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("file_{}", file_id));
+        .unwrap_or_else(|| format!("file_{ }", file_id));
 
     unsafe {
         let chunk_size = window_size;
@@ -1013,28 +1154,40 @@ pub async fn send_file(
         let mut buf = vec![0u8; chunk_size];
         for chunk_index in 0..total_chunks {
             let n = file.read(&mut buf).await?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;     
+           
+            }
             chunks.push(FileChunk {
                 file_id,
                 chunk_index,
-                total_chunks: if chunk_index == 0 { Some(total_chunks) } else { None },
+                total_chunks: if chunk_index == 0 { 
+                    Some(total_chunks)     
+                
+                } else { 
+                    None     
+                
+                },
                 filename: Some(filename.clone()),
                 payload: buf[..n].to_vec(),
                 src: None,
+           
             });
+       
         }
-        
 
         // Initialize per-client ACK tracking
         let clients: Vec<SocketAddr> = {
             let t = targets.lock().await;
             t.iter().copied().collect()
+       
         };
         {
             let mut ack_lock = ack_map.lock().await;
             let mut fa = FileAck::new();
             fa.init_clients(&clients);
             ack_lock.insert(file_id, fa);
+       
         }
 
         let mut retries: HashMap<SocketAddr, usize> = clients.iter().map(|&a| (a, 0)).collect();
@@ -1044,13 +1197,16 @@ pub async fn send_file(
             // Determine remaining clients per chunk
             let remaining_clients: Vec<SocketAddr> = {
                 let ack_lock = ack_map.lock().await;
-                ack_lock.get(&file_id)
+                ack_lock
+                    .get(&file_id)
                     .map(|fa| fa.remaining_clients(total_chunks))
                     .unwrap_or_default()
+           
             };
 
             if remaining_clients.is_empty() {
                 break; // all clients done
+           
             }
 
             // Send missing chunks to remaining clients
@@ -1058,31 +1214,42 @@ pub async fn send_file(
                 for chunk in &chunks {
                     let need_send = {
                         let ack_lock = ack_map.lock().await;
-                        ack_lock.get(&file_id)
+                        ack_lock
+                            .get(&file_id)
                             .and_then(|fa| fa.per_client.get(&addr))
                             .map_or(true, |s| !s.contains(&chunk.chunk_index))
+                   
                     };
 
                     if need_send {
                         let _ = socket.send_to(&chunk.to_bytes(), addr).await;
+                   
                     }
+               
                 }
+           
             }
 
             // Sleep briefly to wait for ACKs
             sleep(Duration::from_millis(50)).await;
 
             // Increment retry counters for clients that still have missing chunks
-            //for &addr in &remaining_clients {
-            //    *retries.get_mut(&addr).unwrap() += 1;
-            //    if retries[&addr] > MAX_RETRIES {
-            //        eprintln!("Client {} failed to receive file {}", addr, filename);
-            //    }
-            //}
+            // for &addr in &remaining_clients {
+            //     *retries.get_mut(&addr).unwrap() += 1;
+            //     if retries[&addr] > MAX_RETRIES {
+            //         eprintln!("Client { } failed to receive file { }", addr, filename);
+            //    
+            //     }
+            //
+            // }
+       
         }
+   
     }
     Ok(())
+
 }
+
 
 
 
@@ -1104,7 +1271,12 @@ pub fn spawn_receiver(
     let seen_chunks = Arc::new(Mutex::new(HashMap::<u32, HashSet<u32>>::new()));
 
     // Spawn resend loop once
-    spawn_forward_resender(socket.clone(), targets.clone(), forward_tracker.clone(), forward_cache.clone());
+    spawn_forward_resender(
+        socket.clone(),
+        targets.clone(),
+        forward_tracker.clone(),
+        forward_cache.clone(),
+    );
 
     tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
@@ -1142,6 +1314,7 @@ pub fn spawn_receiver(
 }
 
 
+
 // ---------------- Helper functions ----------------
 
 // -------------------- TARGET UPDATE --------------------
@@ -1175,7 +1348,9 @@ async fn try_handle_chat(
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     server_mode: bool,
 ) -> bool {
-    if buf.len() < 3 || &buf[..3] != MSG_PREFIX { return false; }
+    if buf.len() < 3 || &buf[..3] != MSG_PREFIX {
+        return false;
+    }
 
     let msg = String::from_utf8_lossy(&buf[3..]).to_string();
     let _ = chat_tx.send(ChatLine::Message {
@@ -1194,6 +1369,7 @@ async fn try_handle_chat(
             }
         }
     }
+
     true
 }
 
@@ -1212,14 +1388,18 @@ pub async fn try_handle_ack(
     let file_acks = ack_lock.entry(ack.file_id).or_insert_with(FileAck::new);
     let is_new = file_acks.acknowledge(src_addr, ack.chunk_index);
 
-    if !is_new { return; }
+    if !is_new {
+        return;
+    }
 
     let total_chunks = {
         let progress_lock = progress_map.lock().await;
         progress_lock.get(&ack.file_id).map(|f| f.total_chunks).unwrap_or(0)
     };
 
-    if total_chunks == 0 { return; }
+    if total_chunks == 0 {
+        return;
+    }
 
     let mut progress_lock = progress_map.lock().await;
     if let Some(entry) = progress_lock.get_mut(&ack.file_id) {
@@ -1229,6 +1409,7 @@ pub async fn try_handle_ack(
         }
     }
 }
+
 
 pub async fn try_handle_file_chunk(
     buf: &[u8],
@@ -1278,7 +1459,9 @@ pub async fn try_handle_file_chunk(
         let entry = tracker_lock.entry(chunk.file_id).or_default();
 
         for &addr in &targets_snapshot {
-            if addr == src { continue; }
+            if addr == src {
+                continue;
+            }
 
             let sent_chunks = entry.entry(addr).or_default();
             if !sent_chunks.contains(&chunk.chunk_index) {
@@ -1330,7 +1513,8 @@ pub fn spawn_forward_resender(
                     .copied()
                     .filter(|&chunk_idx| {
                         targets_snapshot.iter().all(|addr| {
-                            entry.get(addr).map_or(false, |sent| sent.contains(&chunk_idx))
+                            entry.get(addr)
+                                .map_or(false, |sent| sent.contains(&chunk_idx))
                         })
                     })
                     .collect();
@@ -1367,11 +1551,13 @@ async fn cleanup_forward_cache(
                 !file_ack.per_client.values().all(|acked_set| acked_set.contains(&chunk_idx))
             });
         }
+
         tracker_lock.entry(file_id).or_default().retain(|_, sent_chunks| {
             !sent_chunks.is_empty()
         });
     }
 }
+
 
 
 async fn update_progress(progress_map: &FileProgressMap, chunk: &FileChunk) {
@@ -1384,15 +1570,15 @@ async fn update_progress(progress_map: &FileProgressMap, chunk: &FileChunk) {
     if entry.total_chunks == 0 {
         if let (Some(total_chunks), Some(name)) = (chunk.total_chunks, chunk.filename.clone()) {
             entry.total_chunks = total_chunks;
-            let pb = ProgressBar::new(total_chunks as u64);
-            pb.set_style(
+            let fp = FileProgress::new(&name.clone(), total_chunks.clone(), &MultiProgress::new());
+            fp.pb.set_style(
                 ProgressStyle::default_bar()
                     .template("{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
                     .unwrap()
                     .progress_chars("=>-"),
             );
-            pb.set_message(format!("Receiving {}", name));
-            entry.pb = pb;
+            fp.pb.set_message(format!("Receiving {}", name));
+            entry.pb = fp.pb;
         }
     }
 
@@ -1403,6 +1589,7 @@ async fn update_progress(progress_map: &FileProgressMap, chunk: &FileChunk) {
         }
     }
 }
+
 
 // -------------------- SERVER & CLIENT RUN --------------------
 async fn run_server(cli: Cli) -> anyhow::Result<()> {
@@ -1419,8 +1606,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let forward_cache: ChunkCache = Arc::new(Mutex::new(HashMap::new()));
 
     let ack_map: Arc<Mutex<HashMap<u32, FileAck>>> = Arc::new(Mutex::new(HashMap::new()));
-    let progress_map: Arc<Mutex<HashMap<u32, FileProgress>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let progress_map: Arc<Mutex<HashMap<u32, FileProgress>>> = Arc::new(Mutex::new(HashMap::new()));
     let total_chunks_map: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // ---------------- Channels ----------------
@@ -1447,7 +1633,9 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     };
 
     // ---------------- Spawn terminal loop ----------------
-    tokio::spawn(async move { terminal_loop(terminal_args).await });
+    tokio::spawn(async move {
+        terminal_loop(terminal_args).await;
+    });
 
     let chat_tx_clone = chat_tx.clone();
     // ---------------- Spawn file manager task ----------------
@@ -1472,6 +1660,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         progress_map.clone(),
         clients.clone(),
         targets_tx.clone(),
+
         true,
         total_chunks_map.clone(),
         forward_tracker.clone(),
@@ -1482,7 +1671,6 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(Duration::from_secs(PORT_ROTATION_DELAY)).await;
         let new_port = compute_port(&secret_bytes, cli.base_port, cli.port_range);
-
         if new_port != current_port {
             drop(socket);
             socket = Arc::new(UdpSocket::bind(("0.0.0.0", new_port)).await?);
@@ -1507,10 +1695,11 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
 
 
 
+
 async fn run_client(cli: Cli, server: String) -> Result<()> {
     let (chat_tx, chat_rx) = mpsc::channel::<ChatLine>(256);
 
-    // Shared state
+    // ---------------- Shared state ----------------
     let file_transfers: FileTransfers = Arc::new(Mutex::new(HashMap::new()));
     let transfer_counter: TransferCounter = Arc::new(Mutex::new(0));
     let redraw_notify = Arc::new(Notify::new());
@@ -1524,9 +1713,8 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
     let clients: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let forward_tracker: ForwardTracker = Arc::new(Mutex::new(HashMap::new()));
     let forward_cache: ChunkCache = Arc::new(Mutex::new(HashMap::new()));
-    
 
-    // Populate initial targets
+    // ---------------- Populate initial targets ----------------
     {
         let ports = compute_possible_ports(&secret_to_bytes(&cli.secret), cli.base_port, cli.port_range);
         let mut t = targets.lock().await;
@@ -1536,7 +1724,7 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         }
     }
 
-    // Send initial hello to server targets
+    // ---------------- Send initial hello to server targets ----------------
     for &addr in targets.lock().await.iter() {
         let mut buf = Vec::with_capacity(MSG_PREFIX.len() + 5);
         buf.extend_from_slice(MSG_PREFIX);
@@ -1544,18 +1732,19 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         let _ = socket.send_to(&buf, addr).await;
     }
 
-    // Channels
+    // ---------------- Channels ----------------
     let (file_chunk_tx, file_chunk_rx) = mpsc::channel::<FileChunk>(1024);
     let (targets_tx, _targets_rx) = mpsc::channel::<SocketAddr>(256);
     let (ack_bcast_tx, _) = broadcast::channel::<(u32, u32, SocketAddr)>(1024);
 
-    // Periodically refresh target list
+    // ---------------- Periodically refresh target list ----------------
     {
         let targets = targets.clone();
         let server = server.clone();
         let secret_bytes = secret_to_bytes(&cli.secret);
         let shared_rng = Arc::new(Mutex::new(StdRng::from_entropy()));
         let rng_clone = shared_rng.clone();
+
         tokio::spawn(async move {
             loop {
                 let mut rng = rng_clone.lock().await;
@@ -1563,18 +1752,20 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
                 unsafe {
                     window_size = MAX_UDP_PAYLOAD / small_entropy;
                 }
+
                 let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range);
                 let mut t = targets.lock().await;
                 t.clear();
                 for port in ports {
                     t.insert(format!("{}:{}", server, port).parse::<SocketAddr>().unwrap());
                 }
+
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
     }
 
-    // Terminal args
+    // ---------------- Terminal args ----------------
     let terminal_args = TerminalArgs {
         socket: socket.clone(),
         targets: targets.clone(),
@@ -1589,12 +1780,12 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         progress_map: progress_map.clone(),
     };
 
-    // Spawn terminal loop
+    // ---------------- Spawn terminal loop ----------------
     tokio::spawn(async move { terminal_loop(terminal_args).await });
 
     let chat_tx_clone = chat_tx.clone();
 
-    // Spawn file manager task
+    // ---------------- Spawn file manager task ----------------
     tokio::spawn(async move {
         file_manager_task(
             file_chunk_rx,
@@ -1607,6 +1798,7 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         .await;
     });
 
+    // ---------------- Spawn receiver ----------------
     spawn_receiver(
         socket.clone(),
         chat_tx.clone(),
@@ -1621,6 +1813,7 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         forward_cache.clone(),
     );
 
+    // ---------------- Wait indefinitely ----------------
     future::pending::<()>().await;
     Ok(())
 }
@@ -1694,6 +1887,7 @@ pub async fn terminal_loop(args: TerminalArgs) {
                     let chat_lock = chat_lines.lock().await;
                     chat_lock.clone()
                 };
+
                 redraw_terminal(
                     &mut stdout,
                     &chat_snapshot,
@@ -1711,7 +1905,7 @@ pub async fn terminal_loop(args: TerminalArgs) {
                         match key_event.code {
                             KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down => auto_scroll = false,
                             KeyCode::Esc => auto_scroll = true,
-                            _ => {}
+                            _ => {},
                         }
 
                         handle_key(
@@ -1754,9 +1948,18 @@ pub async fn terminal_loop(args: TerminalArgs) {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
     match &cli.role {
-        Role::Server => { println!("Starting server..."); run_server(cli.clone()).await?; }
-        Role::Client { server } => { println!("Starting client connecting to {}...", server); run_client(cli.clone(), server.clone()).await?; }
+        Role::Server => {
+            println!("Starting server...");
+            run_server(cli.clone()).await?;
+        }
+        Role::Client { server } => {
+            println!("Starting client connecting to {}...", server);
+            run_client(cli.clone(), server.clone()).await?;
+        }
     }
+
     Ok(())
 }
+
