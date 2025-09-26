@@ -31,6 +31,10 @@ use std::future;
 use futures::SinkExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
+use rand::Rng;
+use rand::rngs::ThreadRng;
+use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 
 
@@ -38,12 +42,12 @@ use std::collections::BTreeMap;
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
-const WINDOW_SIZE: usize = MAX_UDP_PAYLOAD / 2;
 const ACK_TIMEOUT_MS: u64 = 200;
 const MAX_RETRIES: usize = 5;
 const HISTORY_LIMIT: usize = 500;
 const RECEIVE_TIMEOUT_MS: u64 =  1000 * 600;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
+static mut window_size:usize = MAX_UDP_PAYLOAD / 2;
 
 // -------------------- TYPES --------------------
 pub type TransferCounter = Arc<Mutex<u32>>;
@@ -356,9 +360,9 @@ async fn chat_push_cap(chat: &ChatHistory, line: ChatLine) {
 struct Cli {
     #[command(subcommand)]
     role: Role,
-    #[arg(short, long, default_value = "4000")]
+    #[arg(short, long, default_value = "1025")]
     base_port: u16,
-    #[arg(short, long, default_value = "1000")]
+    #[arg(short, long, default_value = "65535")]
     port_range: u16,
     #[arg(short, long)]
     secret: String,
@@ -1000,81 +1004,83 @@ pub async fn send_file(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| format!("file_{}", file_id));
 
-    let chunk_size = WINDOW_SIZE;
-    let total_chunks = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
+    unsafe {
+        let chunk_size = window_size;
+        let total_chunks = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
 
-    // Read all chunks
-    let mut chunks: Vec<FileChunk> = Vec::with_capacity(total_chunks as usize);
-    let mut buf = vec![0u8; chunk_size];
-    for chunk_index in 0..total_chunks {
-        let n = file.read(&mut buf).await?;
-        if n == 0 { break; }
-        chunks.push(FileChunk {
-            file_id,
-            chunk_index,
-            total_chunks: if chunk_index == 0 { Some(total_chunks) } else { None },
-            filename: Some(filename.clone()),
-            payload: buf[..n].to_vec(),
-            src: None,
-        });
-    }
+        // Read all chunks
+        let mut chunks: Vec<FileChunk> = Vec::with_capacity(total_chunks as usize);
+        let mut buf = vec![0u8; chunk_size];
+        for chunk_index in 0..total_chunks {
+            let n = file.read(&mut buf).await?;
+            if n == 0 { break; }
+            chunks.push(FileChunk {
+                file_id,
+                chunk_index,
+                total_chunks: if chunk_index == 0 { Some(total_chunks) } else { None },
+                filename: Some(filename.clone()),
+                payload: buf[..n].to_vec(),
+                src: None,
+            });
+        }
+        
 
-    // Initialize per-client ACK tracking
-    let clients: Vec<SocketAddr> = {
-        let t = targets.lock().await;
-        t.iter().copied().collect()
-    };
-    {
-        let mut ack_lock = ack_map.lock().await;
-        let mut fa = FileAck::new();
-        fa.init_clients(&clients);
-        ack_lock.insert(file_id, fa);
-    }
-
-    let mut retries: HashMap<SocketAddr, usize> = clients.iter().map(|&a| (a, 0)).collect();
-
-    // Main sending loop
-    loop {
-        // Determine remaining clients per chunk
-        let remaining_clients: Vec<SocketAddr> = {
-            let ack_lock = ack_map.lock().await;
-            ack_lock.get(&file_id)
-                .map(|fa| fa.remaining_clients(total_chunks))
-                .unwrap_or_default()
+        // Initialize per-client ACK tracking
+        let clients: Vec<SocketAddr> = {
+            let t = targets.lock().await;
+            t.iter().copied().collect()
         };
-
-        if remaining_clients.is_empty() {
-            break; // all clients done
+        {
+            let mut ack_lock = ack_map.lock().await;
+            let mut fa = FileAck::new();
+            fa.init_clients(&clients);
+            ack_lock.insert(file_id, fa);
         }
 
-        // Send missing chunks to remaining clients
-        for &addr in &remaining_clients {
-            for chunk in &chunks {
-                let need_send = {
-                    let ack_lock = ack_map.lock().await;
-                    ack_lock.get(&file_id)
-                        .and_then(|fa| fa.per_client.get(&addr))
-                        .map_or(true, |s| !s.contains(&chunk.chunk_index))
-                };
+        let mut retries: HashMap<SocketAddr, usize> = clients.iter().map(|&a| (a, 0)).collect();
 
-                if need_send {
-                    let _ = socket.send_to(&chunk.to_bytes(), addr).await;
+        // Main sending loop
+        loop {
+            // Determine remaining clients per chunk
+            let remaining_clients: Vec<SocketAddr> = {
+                let ack_lock = ack_map.lock().await;
+                ack_lock.get(&file_id)
+                    .map(|fa| fa.remaining_clients(total_chunks))
+                    .unwrap_or_default()
+            };
+
+            if remaining_clients.is_empty() {
+                break; // all clients done
+            }
+
+            // Send missing chunks to remaining clients
+            for &addr in &remaining_clients {
+                for chunk in &chunks {
+                    let need_send = {
+                        let ack_lock = ack_map.lock().await;
+                        ack_lock.get(&file_id)
+                            .and_then(|fa| fa.per_client.get(&addr))
+                            .map_or(true, |s| !s.contains(&chunk.chunk_index))
+                    };
+
+                    if need_send {
+                        let _ = socket.send_to(&chunk.to_bytes(), addr).await;
+                    }
                 }
             }
+
+            // Sleep briefly to wait for ACKs
+            sleep(Duration::from_millis(50)).await;
+
+            // Increment retry counters for clients that still have missing chunks
+            //for &addr in &remaining_clients {
+            //    *retries.get_mut(&addr).unwrap() += 1;
+            //    if retries[&addr] > MAX_RETRIES {
+            //        eprintln!("Client {} failed to receive file {}", addr, filename);
+            //    }
+            //}
         }
-
-        // Sleep briefly to wait for ACKs
-        sleep(Duration::from_millis(50)).await;
-
-        // Increment retry counters for clients that still have missing chunks
-        //for &addr in &remaining_clients {
-        //    *retries.get_mut(&addr).unwrap() += 1;
-        //    if retries[&addr] > MAX_RETRIES {
-        //        eprintln!("Client {} failed to receive file {}", addr, filename);
-        //    }
-        //}
     }
-
     Ok(())
 }
 
@@ -1518,6 +1524,7 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
     let clients: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let forward_tracker: ForwardTracker = Arc::new(Mutex::new(HashMap::new()));
     let forward_cache: ChunkCache = Arc::new(Mutex::new(HashMap::new()));
+    
 
     // Populate initial targets
     {
@@ -1547,8 +1554,15 @@ async fn run_client(cli: Cli, server: String) -> Result<()> {
         let targets = targets.clone();
         let server = server.clone();
         let secret_bytes = secret_to_bytes(&cli.secret);
+        let shared_rng = Arc::new(Mutex::new(StdRng::from_entropy()));
+        let rng_clone = shared_rng.clone();
         tokio::spawn(async move {
             loop {
+                let mut rng = rng_clone.lock().await;
+                let small_entropy = rng.gen_range(1..30);
+                unsafe {
+                    window_size = MAX_UDP_PAYLOAD / small_entropy;
+                }
                 let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range);
                 let mut t = targets.lock().await;
                 t.clear();
