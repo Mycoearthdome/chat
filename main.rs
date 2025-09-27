@@ -40,11 +40,11 @@ use rand::SeedableRng;
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
-const ACK_TIMEOUT_MS: u64 = 5000;
+const ACK_TIMEOUT_MS: u64 = 1000;
 const MAX_RETRIES: usize = 5;
 const HISTORY_LIMIT: usize = 500;
-const RECEIVE_TIMEOUT_MS: u64 =  10000;
-const PORT_ROTATION_DELAY: u64 = 180; // secs
+const RECEIVE_TIMEOUT_MS: u64 =  1500;
+const PORT_ROTATION_DELAY: u64 = 60; // secs
 static mut window_size:usize = MAX_UDP_PAYLOAD / 2;
 
 // -------------------- TYPES --------------------
@@ -467,7 +467,6 @@ impl Drop for TerminalGuard {
         disable_raw_mode().unwrap();
         let mut stdout = stdout();
         let _ = execute!(stdout, Clear(ClearType::All), cursor::MoveTo(0,0));
-   
 }
 
 }
@@ -519,7 +518,7 @@ async fn redraw_terminal(
         let ts = match entry {
             ChatLine::Message { ts, .. } | ChatLine::Transfer { ts, .. } => ts,
         };
-        lines.push(format!("[{}] {}", ts.format("%H:%M:%S"), entry));
+        lines.push(format!("{}", entry));
     }
 
     // --- File transfers ---
@@ -1214,17 +1213,13 @@ pub async fn send_file(
             sleep(Duration::from_millis(50)).await;
 
             // Increment retry counters for clients that still have missing chunks
-            // for &addr in &remaining_clients {
-            //     *retries.get_mut(&addr).unwrap() += 1;
-            //     if retries[&addr] > MAX_RETRIES {
-            //         eprintln!("Client { } failed to receive file { }", addr, filename);
-            //    
-            //     }
-            //
-            // }
-       
+            for &addr in &remaining_clients {
+                *retries.get_mut(&addr).unwrap() += 1;
+                if retries[&addr] > MAX_RETRIES {
+                    break; // 
+                }
+            }
         }
-   
     }
     Ok(())
 
@@ -1306,7 +1301,11 @@ async fn update_targets(
 ) {
     if server_mode {
         // Add new client if in server mode
-        targets.lock().await.insert(src);
+        let mut t = targets.lock().await;
+        if !t.contains(&src) {
+            t.insert(src);
+        }
+
     } else {
         // In client mode, only keep the latest sender
         let mut t = targets.lock().await;
@@ -1320,36 +1319,41 @@ async fn update_targets(
     let _ = targets_tx.try_send(src);
 }
 
-async fn try_handle_chat(
+pub async fn try_handle_chat(
     buf: &[u8],
     src: SocketAddr,
     chat_tx: &mpsc::Sender<ChatLine>,
-    socket: &Arc<UdpSocket>,
+    socket: &UdpSocket,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     server_mode: bool,
 ) -> bool {
-    if buf.len() < 3 || &buf[..3] != MSG_PREFIX {
+    if buf.len() < 3
+        || &buf[..3] != MSG_PREFIX
+        || &buf[..3] == ACK_PREFIX
+    {
         return false;
     }
+    // Interpret the buffer as UTF-8 chat message
+    if let Ok(msg) = std::str::from_utf8(buf) {
+        // Only push to UI if this is not a self-echo
+        let chat_line = ChatLine::Message {
+            // timestamp is already part of msg (sender included it)
+            ts: Local::now(),
+            msg: msg[3..].to_string(),
+        };
+        let _ = chat_tx.send(chat_line).await;
+        
 
-    let msg = String::from_utf8_lossy(&buf[3..]).to_string();
-    let _ = chat_tx.send(ChatLine::Message {
-        ts: Local::now(),
-        msg: format!("{} says: {}", src, msg),
-    }).await;
-
-    if server_mode {
-        let targets_snapshot = targets.lock().await.clone();
-        for &addr in &targets_snapshot {
-            if addr != src {
-                let mut buf_to_send = Vec::with_capacity(3 + msg.len());
-                buf_to_send.extend_from_slice(MSG_PREFIX);
-                buf_to_send.extend_from_slice(msg.as_bytes());
-                let _ = socket.send_to(&buf_to_send, addr).await;
+        // Server should relay to all peers except original sender
+        if server_mode {
+            let peers = targets.lock().await.clone();
+            for peer in peers {
+                if peer != src {
+                    let _ = socket.send_to(buf, peer).await;
+                }
             }
         }
     }
-
     true
 }
 
@@ -1358,10 +1362,18 @@ pub async fn try_handle_ack(
     src_addr: SocketAddr,
     ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
     progress_map: Arc<Mutex<HashMap<u32, FileProgress>>>,
-) {
+) -> bool {
+
+    if ack_buf.len() < 3
+        || &ack_buf[..3] == MSG_PREFIX
+        || &ack_buf[..3] != ACK_PREFIX
+    {
+        return false;
+    }
+
     let ack = match AckPacket::from_bytes(ack_buf) {
         Some(a) => a,
-        None => return,
+        None => return false,
     };
 
     let mut ack_lock = ack_map.lock().await;
@@ -1369,7 +1381,7 @@ pub async fn try_handle_ack(
     let is_new = file_acks.acknowledge(src_addr, ack.chunk_index);
 
     if !is_new {
-        return;
+        return false;
     }
 
     let total_chunks = {
@@ -1378,7 +1390,7 @@ pub async fn try_handle_ack(
     };
 
     if total_chunks == 0 {
-        return;
+        return false;
     }
 
     let mut progress_lock = progress_map.lock().await;
@@ -1388,6 +1400,7 @@ pub async fn try_handle_ack(
             entry.pb.finish_with_message("Upload Completed");
         }
     }
+    true
 }
 
 
@@ -1402,11 +1415,19 @@ pub async fn try_handle_file_chunk(
     progress_map: &FileProgressMap,
     forward_tracker: &ForwardTracker,
     forward_cache: &ChunkCache,
-) {
+) -> bool {
+
+    if buf.len() < 3
+        || &buf[..3] == MSG_PREFIX
+        || &buf[..3] == ACK_PREFIX
+    {
+        return false;
+    }
+
     // Parse incoming chunk
     let chunk = match FileChunk::from_bytes(buf, src) {
         Some(c) => c,
-        None => return,
+        None => return false,
     };
 
     // Deduplicate per-server
@@ -1415,6 +1436,8 @@ pub async fn try_handle_file_chunk(
         let file_entry = seen_lock.entry(chunk.file_id).or_default();
         file_entry.insert(chunk.chunk_index)
     };
+
+    
 
     // Send ACK back to sender
     if is_new {
@@ -1456,6 +1479,8 @@ pub async fn try_handle_file_chunk(
 
     // Deliver downstream to other tasks
     let _ = file_chunk_tx.send(chunk).await;
+
+    true
 }
 
 pub fn spawn_forward_resender(
@@ -1640,7 +1665,6 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         progress_map.clone(),
         clients.clone(),
         targets_tx.clone(),
-
         true,
         total_chunks_map.clone(),
         forward_tracker.clone(),
