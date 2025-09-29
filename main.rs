@@ -48,6 +48,12 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 // Random utilities
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
+// cryptography
+use aes_gcm::{Aes256Gcm, Nonce, KeyInit};
+use base64::{engine::general_purpose, Engine as _};
+use aes_gcm::aead::{Aead};
+use sha2::Sha256;
+
 
 // -------------------- CONSTANTS --------------------
 const MAX_UDP_PAYLOAD: usize = 65507;
@@ -58,6 +64,12 @@ const HISTORY_LIMIT: usize = 500;
 const RECEIVE_TIMEOUT_MS: u64 =  1500;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
 static mut WINDOW_SIZE:usize = MAX_UDP_PAYLOAD - 1000;
+
+// cryptography constants
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
+const KEY_LEN: usize = 32;
+const PBKDF2_ITERS: u32 = 100_000;
 
 // -------------------- TYPES --------------------
 pub type TransferCounter = Arc<Mutex<u32>>;
@@ -346,6 +358,7 @@ struct TerminalArgs {
     pub transfer_counter: TransferCounter,
     pub chat_rx: Arc<Mutex<broadcast::Receiver<ChatLine>>>,
     pub ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
+    secret: String,
  }
 
 async fn chat_push_cap(chat: &ChatHistory, line: ChatLine) {
@@ -373,9 +386,7 @@ struct Cli {
 #[derive(Subcommand, Clone)]
 enum Role {
     Server,
-    Client { #[arg(short, long, default_value = "127.0.0.1")] server: String
-},
-
+    Client { #[arg(short, long, default_value = "127.0.0.1")] server: String},
 }
 
 // -------------------- UTILS --------------------
@@ -437,6 +448,48 @@ fn compute_possible_ports(secret_bytes: &[u8], base_port: u16, port_range: u16) 
    
 }).collect()
 
+}
+
+fn derive_key(password: &str) -> [u8; KEY_LEN] {
+    // deterministically derive salt from password
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    let hash = hasher.finalize();
+    let salt = &hash[..SALT_LEN];
+
+    // PBKDF2 with fixed salt to get 32-byte key
+    let mut key = [0u8; KEY_LEN];
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, PBKDF2_ITERS, &mut key);
+    key
+}
+
+fn derive_nonce(plaintext: &str) -> [u8; NONCE_LEN] {
+    // deterministically derive nonce from plaintext
+    let hash = Sha256::digest(plaintext.as_bytes());
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&hash[..NONCE_LEN]);
+    nonce
+}
+
+fn encrypt_string(password: &str, plaintext: &str) -> Result<String> {
+    let key_bytes = derive_key(password);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
+    let nonce_bytes = derive_nonce(&(password.to_owned()+"batman"));//<--do better!
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+    Ok(general_purpose::URL_SAFE_NO_PAD.encode(ciphertext))
+}
+
+fn decrypt_string(password: &str, ciphertext_b64: &str) -> Result<String> {
+    let key_bytes = derive_key(password);
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
+    let nonce_bytes = derive_nonce(&(password.to_owned()+"batman")); //<--do better!
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = general_purpose::URL_SAFE_NO_PAD.decode(ciphertext_b64)?;
+    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).unwrap();
+    Ok(String::from_utf8(plaintext)?)
 }
 
 // -------------------- TERMINAL --------------------
@@ -608,6 +661,7 @@ async fn handle_key(
     socket_clone_for_send: Arc<UdpSocket>,
     targets_clone_for_send: Arc<Mutex<HashSet<SocketAddr>>>,
     ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
+    secret: String,
 ) {
     match key_event.code {
         KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -691,9 +745,12 @@ async fn handle_key(
                     let _ = execute!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0));
                     std::process::exit(0);
                 } else {
+					// ENCRYPT
+					let encrypted = encrypt_string(&secret, &input).expect("ERROR: Encrupting message failed");
+					
                     let targets_lock = targets.lock().await;
                     for &addr in targets_lock.iter() {
-                        let _ = send_chat_message_to_target(socket.clone(), addr, &input).await;
+                        let _ = send_chat_message_to_target(socket.clone(), addr, &encrypted).await;
                     }
                     chat_push_cap(
                         chat,
@@ -1188,6 +1245,7 @@ async fn spawn_receiver(
     targets_tx: broadcast::Sender<SocketAddr>,
     server_mode: bool,
     forward_cache: ChunkCache,
+    secret: String,
 ) {
 	
     let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
@@ -1199,7 +1257,7 @@ async fn spawn_receiver(
             update_targets(src, &targets, &targets_tx, server_mode).await;
 
             // handle chat
-            try_handle_chat(&buf[..len], src, &chat_tx, &socket, &targets, server_mode).await;
+            try_handle_chat(&buf[..len], src, &chat_tx, &socket, &targets, server_mode, secret).await;
 
             // handle ACK
             try_handle_ack(&buf[..len], src, ack_map.clone(), progress_map.clone()).await;
@@ -1259,6 +1317,7 @@ async fn try_handle_chat(
     socket: &UdpSocket,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     server_mode: bool,
+    secret: String,
 ) -> bool {
     if buf.len() < 3
         || &buf[..3] != MSG_PREFIX
@@ -1268,11 +1327,13 @@ async fn try_handle_chat(
     }
     // Interpret the buffer as UTF-8 chat message
     if let Ok(msg) = std::str::from_utf8(buf) {
-        // Only push to UI if this is not a self-echo
+        // DECRYPT
+        let decrypted = decrypt_string(&secret, &msg[3..]).expect("ERROR: Decrypting the message failed!");
+        
         let chat_line = ChatLine::Message {
             // timestamp is already part of msg (sender included it)
             ts: Local::now(),
-            msg: msg[3..].to_string(),
+            msg: decrypted,
         };
         let _ = chat_tx.send(chat_line);
         
@@ -1440,6 +1501,7 @@ async fn terminal_loop(args: TerminalArgs) {
         transfer_counter,
         chat_rx,
         ack_map,
+        secret,
     } = args;
 
     let _guard = TerminalGuard::new();
@@ -1526,7 +1588,7 @@ async fn terminal_loop(args: TerminalArgs) {
                             _ => {},
                         }
 
-                        handle_key(key_event, &mut input_buffer, &chat_lines, &socket, &targets, &redraw_notify, &transfer_counter, &mut history, &mut search_result_index, &mut search_mode, &mut search_buffer, &mut history_index, &mut desired_scroll_offset, visible_rows, socket.clone(), targets.clone(), ack_map.clone()).await;
+                        handle_key(key_event, &mut input_buffer, &chat_lines, &socket, &targets, &redraw_notify, &transfer_counter, &mut history, &mut search_result_index, &mut search_mode, &mut search_buffer, &mut history_index, &mut desired_scroll_offset, visible_rows, socket.clone(), targets.clone(), ack_map.clone(), secret.clone()).await;
                     }
                 }
             }
@@ -1569,6 +1631,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         transfer_counter: transfer_counter.clone(),
         chat_rx: Arc::new(Mutex::new(chat_tx.subscribe())),
         ack_map: ack_map.clone(),
+        secret: cli.secret.clone(),
     };
 
     // ---------------- Spawn terminal loop ----------------
@@ -1602,6 +1665,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         let clients_clone = clients.clone();
         let targets_tx_clone = targets_tx.clone();
         let forward_cache_clone = forward_cache.clone();
+        let secret = cli.secret.clone();
 
         let _poll_result = task::spawn_blocking(|| {
                 // This is blocking, safe inside spawn_blocking
@@ -1618,6 +1682,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
                             targets_tx_clone,
                             true,
                             forward_cache_clone,
+                            secret,
                         )
                         .await;
                     }
@@ -1675,7 +1740,8 @@ async fn run_client(cli: Cli, server: String) {
         let mut buf = Vec::with_capacity(MSG_PREFIX.len() + 5);
         buf.extend_from_slice(MSG_PREFIX);
         buf.extend_from_slice(b"hello");
-        let _ = socket.send_to(&buf, addr).await;
+        let encrypted_hello_bytes = encrypt_string(&cli.secret.clone(), &String::from_utf8(buf.clone()).expect("ERROR: invalid character in string")).expect("Error: Hello encryption failed").into_bytes();
+        let _ = socket.send_to(&encrypted_hello_bytes, addr).await;
     }
 
     // ---------------- Channels ----------------
@@ -1720,6 +1786,7 @@ async fn run_client(cli: Cli, server: String) {
         transfer_counter: transfer_counter.clone(),
         chat_rx: Arc::new(Mutex::new(chat_tx.subscribe())),
         ack_map: ack_map.clone(),
+        secret: cli.secret.clone(),
     };
 
     // ---------------- Spawn terminal loop ----------------
@@ -1749,6 +1816,7 @@ async fn run_client(cli: Cli, server: String) {
         let clients_clone = clients.clone();
         let targets_tx_clone = targets_tx.clone();
         let forward_cache_clone = forward_cache.clone();
+        let secret = cli.secret.clone();
 
         // Run the blocking poll without blocking the async runtime
         let _poll_result = task::spawn_blocking(|| {
@@ -1766,6 +1834,7 @@ async fn run_client(cli: Cli, server: String) {
                         targets_tx_clone,
                         false,
                         forward_cache_clone,
+                        secret,
                     )
                     .await;
                 }
