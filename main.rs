@@ -8,8 +8,11 @@ use tokio::{
     net::UdpSocket,
     sync::{broadcast, Mutex, Notify},
     task,
-    time::{sleep, Duration, Instant},
+    time::{sleep, Duration, Instant, timeout},
 };
+
+// Port rotation
+use socket2::{Socket, Domain, Type, Protocol};
 
 // Standard library
 use std::{
@@ -20,12 +23,12 @@ use std::{
     io::{stdout, Write},
     net::SocketAddr,
     path::Path,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool, atomic::Ordering},
     time::SystemTime,
 };
 
 // Cryptography
-use sha1::{Digest, Sha1};
+use sha2::{Sha256, Digest};
 
 // Terminal UI
 use crossterm::{
@@ -52,7 +55,6 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use aes_gcm::{Aes256Gcm, Nonce, KeyInit};
 use base64::{engine::general_purpose, Engine as _};
 use aes_gcm::aead::{Aead};
-use sha2::Sha256;
 
 
 // -------------------- CONSTANTS --------------------More at the bottom
@@ -63,6 +65,7 @@ const MAX_RETRIES: usize = 5;
 const HISTORY_LIMIT: usize = 500;
 const RECEIVE_TIMEOUT_MS: u64 =  1500;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
+const HASH_PERIOD_SECS: u64 = 60;
 static mut WINDOW_SIZE:usize = MAX_UDP_PAYLOAD - 1000;
 
 // cryptography constants
@@ -359,7 +362,7 @@ struct TerminalArgs {
     pub chat_rx: Arc<Mutex<broadcast::Receiver<ChatLine>>>,
     pub ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
     secret: String,
- }
+}
 
 async fn chat_push_cap(chat: &ChatHistory, line: ChatLine) {
     let mut c = chat.lock().await; // lock the mutex
@@ -390,66 +393,96 @@ enum Role {
 }
 
 // -------------------- UTILS --------------------
-fn secret_to_bytes(secret: &str) -> Vec<u8> {
-    let mut hasher = Sha1::new();
-    hasher.update(secret.as_bytes());
-    hasher.finalize().to_vec()
+/// Shared port derivation function
+fn derive_port_from_period(
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    period_index: u64,
+) -> u16 {
+    if port_range == 0 {
+        return base_port;
+    }
 
+    let mut hasher = Sha256::new();
+    hasher.update(secret_bytes);
+    hasher.update(&period_index.to_be_bytes());
+    let digest = hasher.finalize();
+
+    // fold all 32 bytes of hash into u16
+    let mut folded: u16 = 0;
+    for chunk in digest.chunks_exact(2) {
+        folded ^= u16::from_be_bytes([chunk[0], chunk[1]]);
+    }
+
+    let range = port_range as u32;
+    let offset = (folded as u32) % range;
+    base_port.wrapping_add(offset as u16)
 }
 
-fn compute_port(secret_bytes: &[u8], base_port: u16, port_range: u16, trigger: &mut SystemTime, current_port: u16, first_run: &mut bool) -> (u16, String) {
-    let should_i = SystemTime::now()
+/// Rotating port calculator
+pub fn compute_port(
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    trigger: &mut SystemTime,
+    current_port: u16,
+    first_run: &mut bool,
+) -> (u16, String) {
+    let elapsed = SystemTime::now()
         .duration_since(*trigger)
-        .unwrap()
+        .unwrap_or(Duration::from_secs(u64::MAX))
         .as_secs();
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    if elapsed >= PORT_ROTATION_DELAY || *first_run {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let period_index = now / HASH_PERIOD_SECS;
 
-    if should_i >= PORT_ROTATION_DELAY || *first_run{
-        let period_index = now / 60; // floor to minute
-
-        let mut hasher = Sha1::new();
-        hasher.update(secret_bytes);
-        hasher.update(&period_index.to_be_bytes());
-        let digest = hasher.finalize();
-        let slice: [u8; 4] = digest[16..20].try_into().unwrap();
-        let val = u32::from_be_bytes(slice);
+        let new_port = derive_port_from_period(secret_bytes, base_port, port_range, period_index);
 
         *trigger = SystemTime::now();
-
-        if *first_run{
-            * first_run = false;
+        if *first_run {
+            *first_run = false;
         }
-        
-        let new_port = base_port + (val % port_range as u32) as u16;
 
-        return (new_port, String::from_utf8(HANDSHAKES[new_port as usize].into()).expect("ERROR:Illegal character in HANDSHAKES"))
+        let handshake = HANDSHAKES
+            .get(new_port as usize)
+            .and_then(|b| String::from_utf8((*b).into()).ok())
+            .unwrap_or_default();
+
+        (new_port, handshake)
+    } else {
+        let handshake = HANDSHAKES
+            .get(current_port as usize)
+            .and_then(|b| String::from_utf8((*b).into()).ok())
+            .unwrap_or_default();
+
+        (current_port, handshake)
     }
-    (current_port, String::from_utf8(HANDSHAKES[current_port as usize].into()).expect("ERROR:Illegal character in HANDSHAKES"))
 }
 
-fn compute_possible_ports(secret_bytes: &[u8], base_port: u16, port_range: u16) -> Vec<u16> {
+/// Compute possible ports for now and a few previous periods
+pub fn compute_possible_ports(
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    previous_periods: u64,
+) -> Vec<u16> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let period_index = now / 60;
+    let current_period = now / HASH_PERIOD_SECS;
 
-    (0..=1).map(|offset| {
-        let idx = period_index.saturating_sub(offset);
-        let mut hasher = Sha1::new();
-        hasher.update(secret_bytes);
-        hasher.update(&idx.to_be_bytes());
-        let digest = hasher.finalize();
-        let slice: [u8; 4] = digest[16..20].try_into().unwrap();
-        let val = u32::from_be_bytes(slice);
-        base_port + (val % port_range as u32) as u16
- 
-}).collect()
-
+    (0..=previous_periods)
+        .map(|offset| {
+            let period = current_period.saturating_sub(offset);
+            derive_port_from_period(secret_bytes, base_port, port_range, period)
+        })
+        .collect()
 }
 
 fn derive_key(password: &str) -> [u8; KEY_LEN] {
@@ -1253,38 +1286,59 @@ async fn spawn_receiver(
     server_mode: bool,
     forward_cache: ChunkCache,
     secret: String,
+    shutdown_flag: Arc<AtomicBool>,
 ) {
-	
     let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
-            
-    match socket.recv_from(&mut buf).await {
+
+    while !shutdown_flag.load(Ordering::Relaxed) {
+        match socket.try_recv_from(&mut buf) {
+			Ok((len, src)) => {
+                // Clone inner state for async operations
+                let targets_snapshot = {
+                    let guard = targets.lock().await;
+                    guard.clone()
+                };
+
+                update_targets(src, &targets, &targets_tx, server_mode).await;
+
+                try_handle_chat(
+                    &buf[..len],
+                    src,
+                    &chat_tx,
+                    &socket,
+                    &targets,
+                    server_mode,
+                    secret.clone(),
+                )
+                .await;
                 
-        Ok((len, src)) => {
-            // update targets (chat & client list)
-            update_targets(src, &targets, &targets_tx, server_mode).await;
+                try_handle_ack(&buf[..len], src, ack_map.clone(), progress_map.clone()).await;
 
-            // handle chat
-            try_handle_chat(&buf[..len], src, &chat_tx, &socket, &targets, server_mode, secret).await;
-
-            // handle ACK
-            try_handle_ack(&buf[..len], src, ack_map.clone(), progress_map.clone()).await;
-
-            // handle file chunks with forwarding
-            try_handle_file_chunk(
-                &buf[..len],
-                src,
-                &socket,
-                &file_chunk_tx,
-                &targets,
-                server_mode,
-                &progress_map,
-                &forward_cache,
-                ack_map,
-            ).await;
+                try_handle_file_chunk(
+                    &buf[..len],
+                    src,
+                    &socket,
+                    &file_chunk_tx,
+                    &targets,
+                    server_mode,
+                    &progress_map,
+                    &forward_cache,
+                    ack_map.clone(),
+                )
+                .await;
+            }
+            Err(_) => {
+				tokio::time::sleep(Duration::from_millis(50)).await;
+                // no packet received; loop continues
+            }
         }
-        Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
     }
+
+    //println!("Receiver task exited cleanly.");
 }
+
+
+
 
 
 
@@ -1613,11 +1667,19 @@ async fn terminal_loop(args: TerminalArgs) {
     }
 }
 
+async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?; // Linux-only, lets multiple sockets bind same addr/port
+    socket.set_nonblocking(true)?;
+    socket.bind(&format!("{}:{}", addr, port).parse::<std::net::SocketAddr>().unwrap().into())?;
+    UdpSocket::from_std(socket.into())
+}
+
 // -------------------- SERVER & CLIENT RUN --------------------
 async fn run_server(cli: Cli) -> anyhow::Result<()> {
-    let (chat_tx, _) = broadcast::channel::<ChatLine>(256);
-
     // ---------------- Shared state ----------------
+    let (chat_tx, _) = broadcast::channel::<ChatLine>(256);
     let file_transfers: FileTransfers = Arc::new(Mutex::new(HashMap::new()));
     let transfer_counter: TransferCounter = Arc::new(Mutex::new(0));
     let redraw_notify = Arc::new(Notify::new());
@@ -1627,21 +1689,32 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let ack_map: Arc<Mutex<HashMap<u32, FileAck>>> = Arc::new(Mutex::new(HashMap::new()));
     let progress_map: Arc<Mutex<HashMap<u32, FileProgress>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // ---------------- Channels ----------------
     let (file_chunk_tx, _) = broadcast::channel::<FileChunk>(1024);
     let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
 
-    let secret_bytes = secret_to_bytes(&cli.secret);
-
+    let secret_bytes = cli.secret.clone().into_bytes();
     let mut trigger = SystemTime::now();
-    let mut first_run: bool = true;
+    let mut first_run = true;
 
-    let (mut current_port, _handshake) = compute_port(&secret_bytes, cli.base_port, cli.port_range, &mut trigger, cli.base_port, &mut first_run);
-    let mut socket = Arc::new(UdpSocket::bind(("0.0.0.0", current_port)).await?);
+    let (mut current_port, _handshake) = compute_port(
+        &secret_bytes,
+        cli.base_port,
+        cli.port_range,
+        &mut trigger,
+        cli.base_port,
+        &mut first_run,
+    );
 
-    // ---------------- Terminal args ----------------
+    // ---------------- Initial socket ----------------
+    let mut arc_socket = Arc::new(
+        make_reusable_socket("0.0.0.0", current_port)
+            .await
+            .expect("Cannot bind initial port"),
+    );
+
+    // ---------------- Terminal task ----------------
     let terminal_args = TerminalArgs {
-        socket: socket.clone(),
+        socket: arc_socket.clone(),
         targets: clients.clone(),
         redraw_notify: redraw_notify.clone(),
         file_transfers: file_transfers.clone(),
@@ -1650,15 +1723,11 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         ack_map: ack_map.clone(),
         secret: cli.secret.clone(),
     };
+    tokio::spawn(async move { terminal_loop(terminal_args).await });
 
-    // ---------------- Spawn terminal loop ----------------
-    tokio::spawn(async move {
-        terminal_loop(terminal_args).await;
-    });
-
+    // ---------------- File manager task ----------------
     let chat_tx_clone = chat_tx.clone();
     let file_chunk_rx_broadcast = file_chunk_tx.subscribe();
-    // ---------------- Spawn file manager task ----------------
     tokio::spawn(async move {
         file_manager_task(
             file_chunk_rx_broadcast,
@@ -1671,61 +1740,113 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         .await;
     });
 
+    // ---------------- Receiver state ----------------
+    let mut spawn_receiver_launched = false;
+    let mut shutdown_flag = Arc::new(AtomicBool::new(false));
+    let mut receiver_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {}); // placeholder
 
+    // ---------------- Main loop ----------------
     loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let socket_clone = socket.clone();
-        let chat_tx_broadcast_1= chat_tx.clone();
-        let file_chunk_tx_broadcast = file_chunk_tx.clone();
-        let ack_map_clone = ack_map.clone();
-        let progress_map_clone = progress_map.clone();
-        let clients_clone = clients.clone();
-        let targets_tx_clone = targets_tx.clone();
-        let forward_cache_clone = forward_cache.clone();
-        let secret = cli.secret.clone();
+        // --- Port rotation ---
+        let (new_port, _handshake) = compute_port(
+            &secret_bytes,
+            cli.base_port,
+            cli.port_range,
+            &mut trigger,
+            current_port,
+            &mut first_run,
+        );
 
-        let _poll_result = task::spawn_blocking(|| {
-                // This is blocking, safe inside spawn_blocking
-                // ---------------- Spawn receiver ----------------
-                tokio::spawn({
-                    async move {
-                        spawn_receiver(
-                            socket_clone,
-                            chat_tx_broadcast_1,
-                            file_chunk_tx_broadcast,
-                            ack_map_clone,
-                            progress_map_clone,
-                            clients_clone,
-                            targets_tx_clone,
-                            true,
-                            forward_cache_clone,
-                            secret,
-                        )
-                        .await;
-                    }
-                });
-                event::poll(Duration::from_millis(50))
-            })
-            .await
-            .expect("Blocking poll task panicked"); // Handle thread panics
+        if new_port != current_port && new_port != cli.base_port {
+            // signal old receiver to shutdown
+            shutdown_flag.store(true, Ordering::Relaxed);
+            receiver_handle.await.expect("Receiver join failed");
 
-            //if let Ok(true) = poll_result {
+            // drop old socket
+            drop(arc_socket);
 
-            //}
-        
-
-        // ---------------- Port rotation loop ----------------
-        let (new_port, _handshake) = compute_port(&secret_bytes, cli.base_port, cli.port_range, &mut trigger, current_port, &mut first_run);
-        if new_port != current_port && new_port != cli.base_port{
-            drop(socket);
-            socket = Arc::new(UdpSocket::bind(("0.0.0.0", new_port)).await?);
+            // bind new socket
+            arc_socket = Arc::new(
+                make_reusable_socket("0.0.0.0", new_port)
+                    .await
+                    .expect("Cannot bind new port"),
+            );
             current_port = new_port;
+
+            // reset shutdown flag for new receiver
+            shutdown_flag = Arc::new(AtomicBool::new(false));
+
+            // spawn new receiver
+            let socket_clone = arc_socket.clone();
+            let shutdown_clone = shutdown_flag.clone();
+            let chat_tx_clone = chat_tx.clone();
+            let file_chunk_tx_clone = file_chunk_tx.clone();
+            let ack_map_clone = ack_map.clone();
+            let progress_map_clone = progress_map.clone();
+            let clients_clone = clients.clone();
+            let targets_tx_clone = targets_tx.clone();
+            let forward_cache_clone = forward_cache.clone();
+            let secret = cli.secret.clone();
+
+            receiver_handle = tokio::spawn(async move {
+                spawn_receiver(
+                    socket_clone,
+                    chat_tx_clone,
+                    file_chunk_tx_clone,
+                    ack_map_clone,
+                    progress_map_clone,
+                    clients_clone,
+                    targets_tx_clone,
+                    true,
+                    forward_cache_clone,
+                    secret,
+                    shutdown_clone,
+                )
+                .await;
+            });
         }
 
-        //small delay to prevent tight loop
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        if !spawn_receiver_launched {
+            // spawn initial receiver
+            let socket_clone = arc_socket.clone();
+            let shutdown_clone = shutdown_flag.clone();
+            let chat_tx_clone = chat_tx.clone();
+            let file_chunk_tx_clone = file_chunk_tx.clone();
+            let ack_map_clone = ack_map.clone();
+            let progress_map_clone = progress_map.clone();
+            let clients_clone = clients.clone();
+            let targets_tx_clone = targets_tx.clone();
+            let forward_cache_clone = forward_cache.clone();
+            let secret = cli.secret.clone();
+
+            receiver_handle = tokio::spawn(async move {
+                spawn_receiver(
+                    socket_clone,
+                    chat_tx_clone,
+                    file_chunk_tx_clone,
+                    ack_map_clone,
+                    progress_map_clone,
+                    clients_clone,
+                    targets_tx_clone,
+                    true,
+                    forward_cache_clone,
+                    secret,
+                    shutdown_clone,
+                )
+                .await;
+            });
+            spawn_receiver_launched = true;
+        }
     }
 }
+
+
+
+
+
+
 
 async fn run_client(cli: Cli, server: String) {
     let (chat_tx, _) = broadcast::channel::<ChatLine>(256);
@@ -1737,60 +1858,58 @@ async fn run_client(cli: Cli, server: String) {
     let ack_tracker: FileAckTracker = Arc::new(Mutex::new(HashMap::new()));
     let ack_map: Arc<Mutex<HashMap<u32, FileAck>>> = Arc::new(Mutex::new(HashMap::new()));
     let progress_map: Arc<Mutex<HashMap<u32, FileProgress>>> = Arc::new(Mutex::new(HashMap::new()));
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("ERROR: Couldn't bind he socket"));
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("ERROR: Couldn't bind socket"));
     let targets: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let clients: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let forward_cache: ChunkCache = Arc::new(Mutex::new(HashMap::new()));
 
     // ---------------- Populate initial targets ----------------
     {
-        let ports = compute_possible_ports(&secret_to_bytes(&cli.secret), cli.base_port, cli.port_range);
+        let ports = compute_possible_ports(&cli.secret.as_bytes(), cli.base_port, cli.port_range, 1);
         let mut t = targets.lock().await;
-        t.clear();
         for port in ports {
-            t.insert(format!("{}:{}", server, port).parse::<SocketAddr>().expect("ERROR: couldn't parse the SocketAddr"));
+            t.insert(format!("{}:{}", server, port).parse::<SocketAddr>().unwrap());
         }
     }
 
-    // ---------------- Send initial hello to server targets ----------------
+    // ---------------- Send initial hello ----------------
     for &addr in targets.lock().await.iter() {
         let mut buf = Vec::with_capacity(MSG_PREFIX.len() + 5);
         buf.extend_from_slice(MSG_PREFIX);
         buf.extend_from_slice(b"hello");
         let handshake = HANDSHAKES[addr.port() as usize];
-        let encrypted_hello_bytes = encrypt_string(&cli.secret.clone(), &String::from_utf8(buf.clone()).expect("ERROR: invalid character in string"), handshake).expect("Error: Hello encryption failed").into_bytes();
-        let _ = socket.send_to(&encrypted_hello_bytes, addr).await;
+        let encrypted = encrypt_string(&cli.secret, &String::from_utf8(buf).unwrap(), handshake)
+            .unwrap()
+            .into_bytes();
+        let _ = socket.send_to(&encrypted, addr).await;
     }
 
     // ---------------- Channels ----------------
     let (file_chunk_tx, _) = broadcast::channel::<FileChunk>(1024);
     let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
 
-    // ---------------- Periodically refresh target list ----------------
+    // ---------------- Periodically refresh targets ----------------
     {
         let targets = targets.clone();
         let server = server.clone();
-        let secret_bytes = secret_to_bytes(&cli.secret);
+        let secret_bytes = cli.secret.clone().into_bytes();
         let shared_rng = Arc::new(Mutex::new(StdRng::from_entropy()));
-        let rng_clone = shared_rng.clone();
 
         tokio::spawn(async move {
             loop {
-                let mut rng = rng_clone.lock().await;
-                
-                let small_entropy = rng.gen_range(MAX_UDP_PAYLOAD-5000..MAX_UDP_PAYLOAD-1000);
-                unsafe {
-                    WINDOW_SIZE = min(small_entropy, MAX_UDP_PAYLOAD-1000)
-                }
+                let mut rng = shared_rng.lock().await;
+                let small_entropy = rng.gen_range(MAX_UDP_PAYLOAD - 5000..MAX_UDP_PAYLOAD - 1000);
+                unsafe { WINDOW_SIZE = min(small_entropy, MAX_UDP_PAYLOAD - 1000) }
 
-                let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range);
+                let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range, 1);
                 let mut t = targets.lock().await;
                 t.clear();
                 for port in ports {
                     t.insert(format!("{}:{}", server, port).parse::<SocketAddr>().unwrap());
                 }
 
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                // refresh less aggressively
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
     }
@@ -1806,16 +1925,13 @@ async fn run_client(cli: Cli, server: String) {
         ack_map: ack_map.clone(),
         secret: cli.secret.clone(),
     };
-
-    // ---------------- Spawn terminal loop ----------------
     tokio::spawn(async move { terminal_loop(terminal_args).await });
 
-	let chat_tx_clone = chat_tx.clone();
-    let file_chunk_rx_broadcast = file_chunk_tx.subscribe();
-    // ---------------- Spawn file manager task ----------------
+    let chat_tx_clone = chat_tx.clone();
+    let file_chunk_rx = file_chunk_tx.subscribe();
     tokio::spawn(async move {
         file_manager_task(
-            file_chunk_rx_broadcast,
+            file_chunk_rx,
             chat_tx_clone,
             file_transfers.clone(),
             transfer_counter.clone(),
@@ -1825,51 +1941,43 @@ async fn run_client(cli: Cli, server: String) {
         .await;
     });
 
-    loop {
-        let socket_clone = socket.clone();
-        let chat_tx_broadcast_1= chat_tx.clone();
-        let file_chunk_tx_broadcast = file_chunk_tx.clone();
-        let ack_map_clone = ack_map.clone();
-        let progress_map_clone = progress_map.clone();
-        let clients_clone = clients.clone();
-        let targets_tx_clone = targets_tx.clone();
-        let forward_cache_clone = forward_cache.clone();
-        let secret = cli.secret.clone();
+	let shutdown_flag = Arc::new(AtomicBool::new(false));
+    // ---------------- Spawn receiver once ----------------
+    tokio::spawn({
+        let socket = socket.clone();
+        let chat_tx = chat_tx.clone();
+        let file_chunk_tx = file_chunk_tx.clone();
+        let ack_map = ack_map.clone();
+        let progress_map = progress_map.clone();
+        let clients = clients.clone();
+        let targets_tx = targets_tx.clone();
+        let forward_cache = forward_cache.clone();
+        let secret = cli.secret.clone();        
 
-        // Run the blocking poll without blocking the async runtime
-        let _poll_result = task::spawn_blocking(|| {
-            // This is blocking, safe inside spawn_blocking
-            tokio::spawn({
-                async move {
-                    // ---------------- Spawn receiver ----------------
-                    spawn_receiver(
-                        socket_clone,
-                        chat_tx_broadcast_1,
-                        file_chunk_tx_broadcast,
-                        ack_map_clone,
-                        progress_map_clone,
-                        clients_clone,
-                        targets_tx_clone,
-                        false,
-                        forward_cache_clone,
-                        secret,
-                    )
-                    .await;
-                }
-            });
-            event::poll(Duration::from_millis(50))
-        })
-        .await
-        .expect("Blocking poll task panicked"); // Handle thread panics
-
-        //if let Ok(true) = poll_result {
-            
-        //}
-
-        //small delay to prevent tight loop
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+        async move {
+            spawn_receiver(
+                socket.clone(),
+                chat_tx.clone(),
+                file_chunk_tx.clone(),
+                ack_map.clone(),
+                progress_map.clone(),
+                clients.clone(),
+                targets_tx.clone(),
+                false,
+                forward_cache.clone(),
+                secret.clone(),
+                shutdown_flag.clone(),  //<--placeholder
+            )
+            .await;
+        }
+    });
+    
+    // Keep client alive until Ctrl+C
+	tokio::signal::ctrl_c()
+		.await
+		.expect("Failed to listen for shutdown signal");
 }
+
 
 // -------------------- MAIN --------------------
 #[tokio::main]
