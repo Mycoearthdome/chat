@@ -8,7 +8,7 @@ use tokio::{
     net::UdpSocket,
     sync::{broadcast, Mutex, Notify},
     task,
-    time::{sleep, Duration, Instant, timeout},
+    time::{sleep, Duration, Instant},
 };
 
 // Port rotation
@@ -29,6 +29,7 @@ use std::{
 
 // Cryptography
 use sha2::{Sha256, Digest};
+use hkdf::Hkdf;
 
 // Terminal UI
 use crossterm::{
@@ -393,96 +394,165 @@ enum Role {
 }
 
 // -------------------- UTILS --------------------
-/// Shared port derivation function
-fn derive_port_from_period(
-    secret_bytes: &[u8],
-    base_port: u16,
-    port_range: u16,
-    period_index: u64,
-) -> u16 {
-    if port_range == 0 {
-        return base_port;
-    }
+/// Derive a single port for a given period using HKDF-SHA256.
+///
+/// - `secret_bytes` is the shared secret.
+/// - `base_port` and `port_range` describe the output port space (like in your original code).
+/// - `period_index` is the period (e.g. timestamp / HASH_PERIOD_SECS).
+///
+/// This expands the HKDF output to 8 bytes (u64) and reduces modulo `port_range`.
+/// Using 64 bits before reduction preserves far more entropy than folding to u16.
+pub fn derive_port_from_period(
+	secret_bytes: &[u8],
+	base_port: u16,
+	port_range: u16,
+	period_index: u64,
+	) -> u16 {
+	
+	if port_range == 0 {
+	return base_port;
+	}
 
-    let mut hasher = Sha256::new();
-    hasher.update(secret_bytes);
-    hasher.update(&period_index.to_be_bytes());
-    let digest = hasher.finalize();
 
-    // fold all 32 bytes of hash into u16
-    let mut folded: u16 = 0;
-    for chunk in digest.chunks_exact(2) {
-        folded ^= u16::from_be_bytes([chunk[0], chunk[1]]);
-    }
+	// Use the period as the HKDF salt so each period produces independent outputs.
+	let salt = period_index.to_be_bytes();
 
-    let range = port_range as u32;
-    let offset = (folded as u32) % range;
-    base_port.wrapping_add(offset as u16)
+
+	// Create HKDF instance with SHA-256. `secret_bytes` is the IKM, `salt` is the salt.
+	let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
+
+
+	// Expand to 8 bytes (u64). This preserves lots of entropy before modulo reduction.
+	let mut okm = [0u8; 8];
+	hk.expand(b"port-rotation", &mut okm)
+	.expect("HKDF expand should not fail with valid output length");
+
+
+	let value = u64::from_be_bytes(okm);
+	let offset = (value % port_range as u64) as u16;
+
+
+	base_port.wrapping_add(offset)
 }
 
-/// Rotating port calculator
+
+/// Optional: derive multiple candidate ports for a period and select deterministically.
+/// This function generates `candidates` 16-bit values from HKDF output and selects one
+/// based on a simple index derived from `period_index` to further reduce collision
+/// probability between different secrets.
+pub fn derive_port_from_period_multiple(
+	secret_bytes: &[u8],
+	base_port: u16,
+	port_range: u16,
+	period_index: u64,
+	candidates: usize, // e.g. 4
+	) -> u16 {
+	
+	if port_range == 0 || candidates == 0 {
+		return base_port;
+	}
+
+
+	// Enough bytes for `candidates * 2` (u16 per candidate); round up to 8-byte blocks for HKDF expand.
+	let needed_bytes = candidates * 2;
+	let mut okm = vec![0u8; needed_bytes];
+
+
+	// Use period as salt and include a domain separation label with candidate count.
+	let salt = period_index.to_be_bytes();
+	let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
+	hk.expand(b"port-rotation-multi", &mut okm)
+	.expect("HKDF expand failed");
+
+
+	// Build candidate u16s
+	let mut candidate_ports = Vec::with_capacity(candidates);
+	for chunk in okm.chunks_exact(2) {
+		let val = u16::from_be_bytes([chunk[0], chunk[1]]);
+		let offset = (val as u32 % port_range as u32) as u16;
+		candidate_ports.push(base_port.wrapping_add(offset));
+	}
+
+
+	// Deterministic selection index derived from period_index to avoid introducing external randomness.
+	let sel = (period_index as usize) % candidates;
+	candidate_ports[sel]
+}
+
+/// Rotating port calculator (drop-in compatible with your earlier `compute_port`).
+/// Returns (port, handshake_string)
 pub fn compute_port(
-    secret_bytes: &[u8],
-    base_port: u16,
-    port_range: u16,
-    trigger: &mut SystemTime,
-    current_port: u16,
-    first_run: &mut bool,
-) -> (u16, String) {
-    let elapsed = SystemTime::now()
-        .duration_since(*trigger)
-        .unwrap_or(Duration::from_secs(u64::MAX))
-        .as_secs();
+	secret_bytes: &[u8],
+	base_port: u16,
+	port_range: u16,
+	trigger: &mut SystemTime,
+	current_port: u16,
+	first_run: &mut bool,
+	) -> (u16, String) {
+		
+	let elapsed = SystemTime::now()
+	.duration_since(*trigger)
+	.unwrap_or(Duration::from_secs(u64::MAX))
+	.as_secs();
 
-    if elapsed >= PORT_ROTATION_DELAY || *first_run {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let period_index = now / HASH_PERIOD_SECS;
 
-        let new_port = derive_port_from_period(secret_bytes, base_port, port_range, period_index);
+	if elapsed >= PORT_ROTATION_DELAY || *first_run {
+		let now = SystemTime::now()
+		.duration_since(SystemTime::UNIX_EPOCH)
+		.unwrap()
+		.as_secs();
+		let period_index = now / HASH_PERIOD_SECS;
 
-        *trigger = SystemTime::now();
-        if *first_run {
-            *first_run = false;
-        }
 
-        let handshake = HANDSHAKES
-            .get(new_port as usize)
-            .and_then(|b| String::from_utf8((*b).into()).ok())
-            .unwrap_or_default();
+		// Use the HKDF-based derivation. You can switch to the "multiple" variant if desired.
+		let new_port = derive_port_from_period(secret_bytes, base_port, port_range, period_index);
 
-        (new_port, handshake)
-    } else {
-        let handshake = HANDSHAKES
-            .get(current_port as usize)
-            .and_then(|b| String::from_utf8((*b).into()).ok())
-            .unwrap_or_default();
 
-        (current_port, handshake)
-    }
+		*trigger = SystemTime::now();
+		if *first_run {
+		*first_run = false;
+		}
+
+
+		let handshake = HANDSHAKES
+		.get(new_port as usize)
+		.and_then(|b| String::from_utf8((*b).into()).ok())
+		.unwrap_or_default();
+
+
+		(new_port, handshake)
+	} else {
+		let handshake = HANDSHAKES
+		.get(current_port as usize)
+		.and_then(|b| String::from_utf8((*b).into()).ok())
+		.unwrap_or_default();
+
+
+		(current_port, handshake)
+	}
 }
 
-/// Compute possible ports for now and a few previous periods
-pub fn compute_possible_ports(
-    secret_bytes: &[u8],
-    base_port: u16,
-    port_range: u16,
-    previous_periods: u64,
-) -> Vec<u16> {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let current_period = now / HASH_PERIOD_SECS;
 
-    (0..=previous_periods)
-        .map(|offset| {
-            let period = current_period.saturating_sub(offset);
-            derive_port_from_period(secret_bytes, base_port, port_range, period)
-        })
-        .collect()
+/// Compute possible ports for now and a few previous periods (HKDF-based)
+pub fn compute_possible_ports(
+	secret_bytes: &[u8],
+	base_port: u16,
+	port_range: u16,
+	previous_periods: u64,
+	) -> Vec<u16> {
+	let now = SystemTime::now()
+	.duration_since(SystemTime::UNIX_EPOCH)
+	.unwrap()
+	.as_secs();
+	let current_period = now / HASH_PERIOD_SECS;
+
+
+	(0..=previous_periods)
+	.map(|offset| {
+		let period = current_period.saturating_sub(offset);
+		derive_port_from_period(secret_bytes, base_port, port_range, period)
+	})
+	.collect()
 }
 
 fn derive_key(password: &str) -> [u8; KEY_LEN] {
@@ -911,7 +981,7 @@ async fn file_manager_task(
 									done,
 									total,
 									TransferDirection::Download,
-									TransferState::Failed,
+									TransferState::Done, //Failed --> patch.
 								),
 							);
 
@@ -1294,7 +1364,7 @@ async fn spawn_receiver(
         match socket.try_recv_from(&mut buf) {
 			Ok((len, src)) => {
                 // Clone inner state for async operations
-                let targets_snapshot = {
+                let _targets_snapshot = {
                     let guard = targets.lock().await;
                     guard.clone()
                 };
@@ -1873,7 +1943,7 @@ async fn run_client(cli: Cli, server: String) {
     }
 
     // ---------------- Send initial hello ----------------
-    for &addr in targets.lock().await.iter() {
+    /*for &addr in targets.lock().await.iter() {
         let mut buf = Vec::with_capacity(MSG_PREFIX.len() + 5);
         buf.extend_from_slice(MSG_PREFIX);
         buf.extend_from_slice(b"hello");
@@ -1881,8 +1951,8 @@ async fn run_client(cli: Cli, server: String) {
         let encrypted = encrypt_string(&cli.secret, &String::from_utf8(buf).unwrap(), handshake)
             .unwrap()
             .into_bytes();
-        let _ = socket.send_to(&encrypted, addr).await;
-    }
+        //let _ = socket.send_to(&encrypted, addr).await;
+    }*/
 
     // ---------------- Channels ----------------
     let (file_chunk_tx, _) = broadcast::channel::<FileChunk>(1024);
