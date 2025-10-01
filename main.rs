@@ -62,9 +62,9 @@ use aes_gcm::aead::{Aead};
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
-const MAX_RETRIES: usize = 5;
+const MAX_RETRIES: usize = 1000;
 const HISTORY_LIMIT: usize = 500;
-const RECEIVE_TIMEOUT_MS: u64 =  1500;
+const RECEIVE_TIMEOUT_MS: u64 =  2000;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
 const HASH_PERIOD_SECS: u64 = 60;
 static mut WINDOW_SIZE:usize = MAX_UDP_PAYLOAD - 1000;
@@ -177,6 +177,12 @@ impl FileAck {
             per_client: HashMap::new(),
         }
     }
+    
+    fn acked(&self, client: SocketAddr, chunk_index: u32) -> bool {
+		self.per_client
+			.get(&client)
+			.map_or(false, |chunks| chunks.contains(&chunk_index))
+	}
 
     /// Initialize tracking for a list of clients
     fn init_clients(&mut self, clients: &[SocketAddr]) {
@@ -981,7 +987,7 @@ async fn file_manager_task(
 									done,
 									total,
 									TransferDirection::Download,
-									TransferState::Done, //Failed --> patch.
+									TransferState::Failed,
 								),
 							);
 
@@ -1220,37 +1226,52 @@ async fn send_file(
             t.iter().copied().collect()
        
         };
+        
         {
-            let mut ack_lock = ack_map.lock().await;
-            let mut fa = FileAck::new();
-            fa.init_clients(&clients);
-            ack_lock.insert(file_id, fa);
-       
+			let mut ack_lock = ack_map.lock().await;
+			let mut fa = FileAck::new();
+			fa.init_clients(&clients);
+			ack_lock.insert(file_id, fa);
         }
+       
+        
 
         // Main sending loop
 
-        for client in clients{
-            for chunk in &chunks {
+        for client in &clients {
+			for chunk in &chunks {
+				
+				let chunk_index = chunk.chunk_index;
 				let mut maximum = MAX_RETRIES;
-                loop{
-                    let _ = socket.send_to(&chunk.to_bytes(), client).await;
-                    
-                    maximum -= 1;
-                    
-                    // Sleep briefly to wait for ACKs
+
+				loop {
+					{
+						// lock only while checking ack status
+						let ack_lock = ack_map.lock().await;
+
+						if let Some(fa) = ack_lock.get(&file_id) {
+							if fa.acked(*client, chunk_index) {
+								break; // already acked → no need to resend
+							}
+						}
+					} // <-- lock is dropped here before awaiting send_to/sleep
+
+					// not acked yet, try sending
+					let _ = socket.send_to(&chunk.to_bytes(), client).await;
+
+					maximum -= 1;
+					if maximum == 0 {
+						break;
+					}
+
+					// Sleep briefly before retrying
 					sleep(Duration::from_millis(50)).await;
-
-                    if maximum == 0{
-                        break;
-                    }
-                    
-                    // Sleep briefly to wait for ACKs
-                    sleep(Duration::from_millis(50)).await;
-
-                }
-            }
-        }
+				}
+				if maximum == 0{
+					break;
+				}
+			}
+		}
     }
     Ok(())
 
@@ -1911,11 +1932,6 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         }
     }
 }
-
-
-
-
-
 
 
 async fn run_client(cli: Cli, server: String) {
