@@ -1290,77 +1290,74 @@ fn spawn_file_transfer_manager(
         use std::collections::HashMap as StdHashMap;
         let mut retry_counts: StdHashMap<(u32, u32, SocketAddr), usize> = StdHashMap::new();
 
-        loop {
-            // snapshot targets
-            let peers: Vec<SocketAddr> = {
-                let tg = targets.lock().await;
-                tg.iter().copied().collect()
-            };
+        
+        // snapshot targets
+        let peers: Vec<SocketAddr> = {
+            let tg = targets.lock().await;
+            tg.iter().copied().collect()
+        };
 
-            // snapshot chunks
-            let chunks: Vec<(u32, u32, FileChunk)> = {
-                let cache = forward_cache.lock().await;
-                cache
-                    .iter()
-                    .flat_map(|(&fid, inner)| {
-                        inner.iter().map(move |(&idx, chunk)| (fid, idx, chunk.clone()))
-                    })
-                    .collect()
-            };
+        // snapshot chunks
+        let chunks: Vec<(u32, u32, FileChunk)> = {
+            let cache = forward_cache.lock().await;
+            cache
+                .iter()
+                .flat_map(|(&fid, inner)| {
+                    inner.iter().map(move |(&idx, chunk)| (fid, idx, chunk.clone()))
+                })
+                .collect()
+        };
 
-            for (fid, idx, chunk) in chunks {
-                // who has acked this chunk already?
-                let acked_peers: Vec<SocketAddr> = {
-					let map = ack_map.lock().await;
-					map.get(&fid)
-						.map(|ack| {
-							ack.per_client.iter()
-							   .filter_map(|(p, done)| if done.contains(&idx) { Some(*p) } else { None })
-							   .collect()
-						})
-						.unwrap_or_default()
-				};
+        for (fid, idx, chunk) in chunks {
+            // who has acked this chunk already?
+            let acked_peers: Vec<SocketAddr> = {
+				let map = ack_map.lock().await;
+				map.get(&fid)
+					.map(|ack| {
+						ack.per_client.iter()
+						   .filter_map(|(p, done)| if done.contains(&idx) { Some(*p) } else { None })
+						   .collect()
+					})
+					.unwrap_or_default()
+			};
 
-                // send to peers who haven't acked
-                for peer in peers.iter().filter(|p| !acked_peers.contains(p)) {
-                    let key = (fid, idx, *peer);
-                    let retries = retry_counts.get(&key).cloned().unwrap_or(0);
+            // send to peers who haven't acked
+            for peer in peers.iter().filter(|p| !acked_peers.contains(p)) {
+                let key = (fid, idx, *peer);
+                let retries = retry_counts.get(&key).cloned().unwrap_or(0);
 
-                    if retries < MAX_RETRIES {
-                        let data = chunk.to_bytes();
-                        let _ = socket.send_to(&data, peer).await;
-                        retry_counts.insert(key, retries + 1);
+                if retries < MAX_RETRIES {
+                    let data = chunk.to_bytes();
+                    let _ = socket.send_to(&data, peer).await;
+                    retry_counts.insert(key, retries + 1);
+                } else {
+                    //eprintln!(
+                    //    "Dropping peer {} for file {} chunk {} after {} retries",
+                    //    peer, fid, idx, MAX_RETRIES
+                    //);
+                }
+            }
+        }
+
+        // cleanup: drop fully acked chunks
+        {
+            let mut cache = forward_cache.lock().await;
+            let map = ack_map.lock().await;
+            for (&fid, chunks_map) in cache.iter_mut() {
+                chunks_map.retain(|&idx, _| {
+                    if let Some(acks) = map.get(&fid) {
+                        let all_done = peers.iter().all(|p| {
+                            acks.per_client
+                                .get(p)
+                                .map(|s| s.contains(&idx))
+                                .unwrap_or(false)
+                        });
+                        !all_done
                     } else {
-                        //eprintln!(
-                        //    "Dropping peer {} for file {} chunk {} after {} retries",
-                        //    peer, fid, idx, MAX_RETRIES
-                        //);
+                        true
                     }
-                }
+                });
             }
-
-            // cleanup: drop fully acked chunks
-            {
-                let mut cache = forward_cache.lock().await;
-                let map = ack_map.lock().await;
-                for (&fid, chunks_map) in cache.iter_mut() {
-                    chunks_map.retain(|&idx, _| {
-                        if let Some(acks) = map.get(&fid) {
-                            let all_done = peers.iter().all(|p| {
-                                acks.per_client
-                                    .get(p)
-                                    .map(|s| s.contains(&idx))
-                                    .unwrap_or(false)
-                            });
-                            !all_done
-                        } else {
-                            true
-                        }
-                    });
-                }
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     });
 }
