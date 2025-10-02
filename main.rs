@@ -4,11 +4,11 @@ use clap::{Parser, Subcommand};
 // Async runtime
 use tokio::{
     fs::File,
-    io::AsyncReadExt,
+    io::{AsyncReadExt},
     net::UdpSocket,
-    sync::{broadcast, Mutex, Notify},
+    sync::{broadcast, Mutex, Notify, broadcast::error::RecvError::Closed, broadcast::error::RecvError::Lagged},
     task,
-    time::{sleep, Duration, Instant},
+    time::{sleep, Duration, Instant, interval},
 };
 
 // Port rotation
@@ -17,10 +17,10 @@ use socket2::{Socket, Domain, Type, Protocol};
 // Standard library
 use std::{
     cmp::min,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::TryInto,
     fmt,
-    io::{stdout, Write},
+    io::{Write, stdout},
     net::SocketAddr,
     path::Path,
     sync::{Arc, atomic::AtomicBool, atomic::Ordering},
@@ -36,9 +36,11 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    style::{Color, Print, ResetColor, SetForegroundColor},
+    //style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType},
+	terminal,
 };
+
 
 // Error handling
 use anyhow::Result;
@@ -47,7 +49,8 @@ use anyhow::Result;
 use chrono::Local;
 
 // Progress bars
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle, ProgressDrawTarget};
+use console::Term;
 
 // Random utilities
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -62,18 +65,27 @@ use aes_gcm::aead::{Aead};
 const MAX_UDP_PAYLOAD: usize = 65507;
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
-const MAX_RETRIES: usize = 1000;
+const MAX_RETRIES: usize = 10;
 const HISTORY_LIMIT: usize = 500;
-const RECEIVE_TIMEOUT_MS: u64 =  2000;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
 const HASH_PERIOD_SECS: u64 = 60;
+const HISTORY_LIMIT_TERMINAL: usize = 1000;
 static mut WINDOW_SIZE:usize = MAX_UDP_PAYLOAD - 1000;
+
 
 // cryptography constants
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 const PBKDF2_ITERS: u32 = 100_000;
+
+
+//BACKOFF constants
+const BASE_RETRY_MS: u64 = 200;
+const MAX_BACKOFF_MS: u64 = 5_000;
+const MAX_RETRIES_PER_CHUNK_PEER: usize = 8;
+const SEND_INTERVAL_MS: u64 = 200;
+
 
 // -------------------- TYPES --------------------
 pub type TransferCounter = Arc<Mutex<u32>>;
@@ -112,32 +124,79 @@ pub enum ChatLine {
 },
 
 }
+/// Snapshot of progress for safe terminal rendering
+struct FileProgressSnapshot {
+    pub filename: String,
+    pub unique_pos: u64,
+    pub unique_len: u64,
+    pub raw_pos: u64,
+    pub state: TransferState,
+}
 
 #[derive(Debug)]
 pub struct FileProgress {
-    pub pb: ProgressBar,
+    pub pb_unique: ProgressBar,
+    pub pb_raw: ProgressBar,
+    pub filename: String,
     pub total_chunks: u32,
-
+    pub state: TransferState,
 }
 
 impl FileProgress {
-    fn new(name: &str, total_chunks: u32, multi: &MultiProgress) -> Self {
-        let pb = multi.add(ProgressBar::new(total_chunks as u64));
-        pb.set_style(
+	
+	pub fn new(mp: &MultiProgress, filename: String, total_chunks: u32) -> Self {
+        // Progress bar for unique chunks
+        let pb_unique = mp.add(ProgressBar::new(total_chunks as u64));
+        pb_unique.set_style(
             ProgressStyle::default_bar()
-                .template("{msg} [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .template("{msg} [unique] {bar:40.cyan/blue} {pos}/{len} ({eta})")
                 .unwrap()
-                .progress_chars("=>-"),
+                .progress_chars("##-"),
         );
-        pb.set_message(format!("Receiving {}", name));
+        pb_unique.set_message(filename.clone());
 
-        Self { pb, total_chunks }
+        // Progress bar for raw ACK count
+        let pb_raw = mp.add(ProgressBar::new(total_chunks as u64));
+        pb_raw.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg} [raw]    {bar:40.green/red} {pos}/{len} ({eta})")
+                .unwrap()
+                .progress_chars("##-"),
+        );
+        pb_raw.set_message(filename.clone());
+
+        Self {
+            pb_unique,
+            pb_raw,
+            filename,
+            total_chunks,
+            state: TransferState::InProgress,
+        }
     }
+	
+    pub fn finish(&mut self, msg: &str) {
+        self.pb_unique.finish_with_message(msg.to_owned());
+        self.state = TransferState::Done;
+    }
+
+    pub fn fail(&mut self, msg: &str) {
+        self.pb_unique.finish_with_message(msg.to_owned());
+        self.state = TransferState::Failed;
+    }
+
+    pub fn tick(&self, unique_received: u64) {
+		// Increment spinner every call (uncapped, continuous rotation)
+		// self.pb_raw.inc(1);
+
+		// Keep unique bar updated with actual received chunks
+		self.pb_unique.set_position(unique_received);
+	}
 }
 
+/// Registry to manage multiple file progress bars
 pub struct ProgressRegistry {
     pub multi: Arc<MultiProgress>,
-    pub map: FileProgressMap,
+    pub map: Arc<Mutex<HashMap<u32, FileProgress>>>,
 }
 
 impl ProgressRegistry {
@@ -148,26 +207,59 @@ impl ProgressRegistry {
         }
     }
 
-    // --- init_progress no longer needs multi as parameter ---
-    pub async fn init_progress(&self, file_id: u32, filename: &str, total_chunks: u32) {
+    /// Initialize progress for a file if not already
+    pub async fn init_progress(&self, file_id: u32, filename: &str, total_chunks: u64) {
         let mut lock = self.map.lock().await;
         lock.entry(file_id)
-            .or_insert_with(|| FileProgress::new(filename, total_chunks, &self.multi));
+            .or_insert_with(|| FileProgress::new( &self.multi, filename.to_string(), total_chunks.try_into().unwrap()));
     }
 
-    pub async fn update_progress(&self, chunk: &FileChunk) {
+    /// Update progress for raw + unique counts
+    pub async fn update_progress(&self, file_id: u32, unique_received: u64) {
         let mut lock = self.map.lock().await;
-        if let Some(entry) = lock.get_mut(&chunk.file_id) {
-            entry.pb.set_position((chunk.chunk_index + 1) as u64);
-            if let Some(total) = chunk.total_chunks {
-                if chunk.chunk_index + 1 == total {
-                    entry.pb.finish_with_message(format!(
-                        "Completed {}",
-                        chunk.filename.clone().unwrap_or_default()
-                    ));
-                }
-            }
+        if let Some(entry) = lock.get_mut(&file_id) {
+            entry.tick(unique_received);
         }
+    }
+    
+    pub async fn ensure_progress(&self, file_id: u32, filename: &str, total_chunks: u64) {
+        let mut lock = self.map.lock().await;
+        if !lock.contains_key(&file_id) {
+            lock.insert(
+                file_id,
+                FileProgress::new(&self.multi, filename.to_string(), total_chunks as u32),
+            );
+        }
+    }
+
+
+    /// Remove a finished file
+    pub async fn remove(&self, file_id: u32) {
+        let mut lock = self.map.lock().await;
+        lock.remove(&file_id);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RetryInfo {
+    retries: usize,
+    last_sent: Instant,
+}
+
+impl RetryInfo {
+    fn new() -> Self {
+        Self {
+            retries: 0,
+            last_sent: Instant::now() - Duration::from_secs(3600),
+        }
+    }
+
+    fn backoff_duration(&self) -> Duration {
+        let base = BASE_RETRY_MS as u128;
+        // exponential: base * 2^retries (cap to MAX_BACKOFF_MS)
+        let mult = 1u128 << self.retries.min(10); // avoid overflow
+        let ms = (base.saturating_mul(mult)) as u64;
+        Duration::from_millis(ms.min(MAX_BACKOFF_MS))
     }
 }
 
@@ -200,7 +292,7 @@ impl AckPacket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FileAck {
     /// Map from client address -> set of chunk indices acknowledged
     pub per_client: HashMap<SocketAddr, HashSet<u32>>,
@@ -238,13 +330,201 @@ impl FileAck {
     fn min_acked(&self) -> usize {
         self.per_client.values().map(|s| s.len()).min().unwrap_or(0)
     }
-}
-
-impl Default for FileAck {
-    fn default() -> Self {
-        Self::new()
+    
+    pub fn total_ack_count(&self) -> usize {
+        self.per_client.values().map(|set| set.len()).sum()
     }
 }
+
+pub struct FileTransferManager {
+    socket: Arc<UdpSocket>,
+    forward_cache: ChunkCache, // HashMap<u32, HashMap<u32, FileChunk>>
+    ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
+    targets: Arc<Mutex<HashSet<std::net::SocketAddr>>>,
+    retry_counts: Arc<Mutex<HashMap<(u32, u32, std::net::SocketAddr), usize>>>,
+    registry: Arc<ProgressRegistry>,
+}
+
+impl FileTransferManager {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        forward_cache: ChunkCache,
+        ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
+        targets: Arc<Mutex<HashSet<SocketAddr>>>,
+        registry: Arc<ProgressRegistry>,
+    ) -> Self {
+        Self {
+            socket,
+            forward_cache,
+            ack_map,
+            targets,
+            retry_counts: Arc::new(Mutex::new(HashMap::new())),
+            registry,
+        }
+    }
+
+   pub fn start(self: Arc<Self>) {
+		let socket = self.socket.clone();
+		let forward_cache = self.forward_cache.clone();
+		let ack_map = self.ack_map.clone();
+		let targets = self.targets.clone();
+		let retry_info: Arc<Mutex<HashMap<(u32, u32, SocketAddr), RetryInfo>>> =
+			Arc::new(Mutex::new(HashMap::new()));
+		let dropped_peers = Arc::new(Mutex::new(HashSet::<(u32, u32, SocketAddr)>::new()));
+		let registry = self.registry.clone();
+
+		tokio::spawn(async move {
+			let mut tick = tokio::time::interval(Duration::from_millis(SEND_INTERVAL_MS));
+
+			loop {
+				tick.tick().await;
+
+				// --- Snapshot peers & chunks ---
+				let peers: Vec<SocketAddr> = {
+					let tg = targets.lock().await;
+					tg.iter().copied().collect()
+				};
+
+				let chunks: Vec<(u32, u32, FileChunk)> = {
+					let cache = forward_cache.lock().await;
+					cache
+						.iter()
+						.flat_map(|(&fid, inner)| inner.iter().map(move |(&idx, chunk)| (fid, idx, chunk.clone())))
+						.collect()
+				};
+
+				let ack_snapshot: HashMap<u32, FileAck> = {
+					let map = ack_map.lock().await;
+					map.clone()
+				};
+
+				for (fid, idx, chunk) in chunks.into_iter() {
+					// --- Initialize/update registry progress ---
+					if let Some(total_chunks) = chunk.total_chunks {
+						let known_filename = {
+							let lock = registry.map.lock().await;
+							lock.get(&fid)
+								.map(|fp| fp.filename.clone())
+								.unwrap_or_else(|| format!("file_{}", fid))
+						};
+						registry.ensure_progress(fid, &known_filename, total_chunks.into()).await;
+					}
+
+					// --- Determine which peers still need this chunk ---
+					let acked_peers: HashSet<SocketAddr> = ack_snapshot
+						.get(&fid)
+						.map(|ack| {
+							ack.per_client
+								.iter()
+								.filter_map(|(p, set)| if set.contains(&idx) { Some(*p) } else { None })
+								.collect()
+						})
+						.unwrap_or_default();
+
+					let peers_to_send: Vec<SocketAddr> =
+						peers.iter().filter(|p| !acked_peers.contains(p)).copied().collect();
+					if peers_to_send.is_empty() {
+						continue;
+					}
+
+					// --- Prepare send futures ---
+					let mut send_futs = Vec::with_capacity(peers_to_send.len());
+
+					for peer in peers_to_send {
+						// skip dropped peers
+						{
+							let dp = dropped_peers.lock().await;
+							if dp.contains(&(fid, idx, peer)) {
+								continue;
+							}
+						}
+
+						let mut ri_lock = retry_info.lock().await;
+						let key = (fid, idx, peer);
+						let info = ri_lock.entry(key.clone()).or_insert_with(RetryInfo::new);
+
+						if info.retries >= MAX_RETRIES_PER_CHUNK_PEER {
+							let mut dp = dropped_peers.lock().await;
+							dp.insert((fid, idx, peer));
+							ri_lock.remove(&key);
+							eprintln!(
+								"Chunk {} of file {} reached max retries for {}. Dropping this peer.",
+								idx, fid, peer
+							);
+							continue;
+						}
+
+						let now = Instant::now();
+						let elapsed = now.saturating_duration_since(info.last_sent);
+						let backoff = info.backoff_duration();
+
+						if elapsed < backoff {
+							continue;
+						}
+
+						info.last_sent = now;
+						info.retries += 1;
+						let current_retry_count = info.retries;
+						drop(ri_lock);
+
+						let data = chunk.to_bytes();
+						let socket_clone = socket.clone();
+						let fut = async move {
+							let res = socket_clone.send_to(&data, peer).await;
+							(peer, res, current_retry_count)
+						};
+						send_futs.push(fut);
+					}
+
+					if !send_futs.is_empty() {
+						let results = futures::future::join_all(send_futs).await;
+						for (peer, send_res, retries_now) in results {
+							if let Err(e) = send_res {
+								if retries_now >= MAX_RETRIES_PER_CHUNK_PEER {
+									let mut dp = dropped_peers.lock().await;
+									dp.insert((fid, idx, peer));
+									eprintln!(
+										"send_to error & retries exhausted for {}:{} -> drop {}",
+										fid, idx, peer
+									);
+								} else {
+									eprintln!("send_to error {}:{} -> {:?}", fid, idx, e);
+								}
+							}
+						}
+					}
+
+					// --- Update progress (unique chunks) ---
+					let unique_received = if let Some(acks) = ack_snapshot.get(&fid) {
+						acks.per_client
+							.values()
+							.flat_map(|s| s.iter().copied())
+							.collect::<HashSet<u32>>()
+							.len() as u64
+					} else {
+						0
+					};
+					registry.update_progress(fid, unique_received).await;
+
+					// --- Cleanup fully ACKed chunks from forward_cache ---
+					let mut cache = forward_cache.lock().await;
+					if let Some(chunks_map) = cache.get_mut(&fid) {
+						chunks_map.retain(|&i, _| {
+							if let Some(acks) = ack_snapshot.get(&fid) {
+								!peers.iter().all(|p| acks.per_client.get(p).map(|s| s.contains(&i)).unwrap_or(false))
+							} else {
+								true
+							}
+						});
+					}
+				} // end per-chunk
+			} // loop
+		});
+	}
+}
+
+
+
 
 
 /// Helper to render progress bars
@@ -405,6 +685,7 @@ struct TerminalArgs {
     pub chat_rx: Arc<Mutex<broadcast::Receiver<ChatLine>>>,
     pub ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
     secret: String,
+    pub progress_registry: Arc<ProgressRegistry>,
 }
 
 async fn chat_push_cap(chat: &ChatHistory, line: ChatLine) {
@@ -641,6 +922,7 @@ fn decrypt_string(password: &str, ciphertext_b64: &str, handshake: &str) -> Resu
 
 // -------------------- TERMINAL --------------------
 struct TerminalGuard;
+
 impl TerminalGuard {
     fn new() -> Self { enable_raw_mode().unwrap(); TerminalGuard
 }
@@ -669,126 +951,6 @@ async fn send_chat_message_to_target(
 
 }
 
-// -------------------- HELPERS & REDRAW --------------------
-fn calculate_start_index(total_lines: usize, visible_rows: usize, scroll_offset: usize) -> usize {
-    if total_lines <= visible_rows {
-        0
-   
-	} else {
-        let max_offset = total_lines - visible_rows;
-        total_lines - visible_rows - scroll_offset.min(max_offset)
-	}
-}
-
-async fn redraw_terminal(
-    stdout: &mut std::io::Stdout,
-    chat_lines: &[ChatLine],
-    file_transfers: &FileTransfers,
-    input_buffer: &str,
-    search_mode: bool,
-    search_buffer: &str,
-    scroll_offset: usize,
-) {
-    let (cols, rows) = size().unwrap_or((100, 30));
-    let visible_rows = rows.saturating_sub(1) as usize;
-    let input_row = rows.saturating_sub(1);
-
-    let mut lines = Vec::new();
-
-    // --- Chat messages ---
-    for entry in chat_lines {
-        let _ts = match entry {
-            ChatLine::Message { ts, .. } | ChatLine::Transfer { ts, .. } => ts,
-        };
-        lines.push(format!("{}", entry));
-    }
-
-    // --- File transfers ---
-    let ft_snapshot = {
-        let file_transfers_clone = file_transfers.clone();
-        let ft_lock = file_transfers_clone.lock().await;
-        ft_lock.clone() // clone the hashmap
-    };
-
-    for (fname, &(done, total, direction, state)) in ft_snapshot.iter() {
-        let percent = if total > 0 {
-            (done as f64 / total as f64 * 100.0).round() as u64
-        } else {
-            0
-        };
-
-        let bar_width = (cols as usize).saturating_sub(30);
-        let filled = ((percent as usize * bar_width) / 100).min(bar_width);
-        let mut bar = String::new();
-        bar.push_str(&"█".repeat(filled));
-        bar.push_str(&"-".repeat(bar_width - filled));
-
-        let color = match (direction, state) {
-            (TransferDirection::Upload, TransferState::InProgress) => Color::Blue,
-            (TransferDirection::Download, TransferState::InProgress) => Color::Green,
-            (_, TransferState::Done) => match direction {
-                TransferDirection::Upload => Color::Blue,
-                TransferDirection::Download => Color::Green,
-            },
-            (_, TransferState::Failed) => Color::Red,
-        };
-
-        let status = match state {
-            TransferState::InProgress => format!("[{}] {}% {}", bar, percent, fname),
-            TransferState::Done => format!("[{} - DONE]", fname),
-            TransferState::Failed => format!("[{} - FAILED]", fname),
-        };
-
-        let _ = execute!(
-            stdout,
-            cursor::MoveTo(0, lines.len() as u16),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(color),
-            Print(status.chars().take(cols as usize).collect::<String>()),
-            ResetColor
-        );
-
-        lines.push(status);
-    }
-
-    // --- Draw visible lines ---
-    let start_idx = calculate_start_index(lines.len(), visible_rows, scroll_offset);
-    for (i, line) in lines[start_idx..].iter().enumerate() {
-        let _ = execute!(
-            stdout,
-            cursor::MoveTo(0, i as u16),
-            Clear(ClearType::CurrentLine),
-            SetForegroundColor(Color::White),
-            Print(line.chars().take(cols as usize).collect::<String>()),
-            ResetColor
-        );
-    }
-
-    // Clear remaining lines
-    for i in lines.len()..visible_rows {
-        let _ = execute!(stdout, cursor::MoveTo(0, i as u16), Clear(ClearType::CurrentLine));
-    }
-
-    // --- Draw prompt ---
-    let prompt = if search_mode {
-        format!("(reverse-i-search)`{}': {}", search_buffer, input_buffer)
-    } else {
-        format!("> {}", input_buffer)
-    };
-
-    let _ = execute!(
-        stdout,
-        cursor::MoveTo(0, input_row),
-        Clear(ClearType::CurrentLine),
-        SetForegroundColor(Color::Yellow),
-        Print(prompt.chars().take(cols as usize).collect::<String>()),
-        ResetColor,
-        cursor::MoveTo(prompt.len() as u16, input_row)
-    );
-
-    let _ = stdout.flush();
-}
-
 // -------------------- KEY HANDLING --------------------
 async fn handle_key(
     key_event: KeyEvent,
@@ -809,6 +971,7 @@ async fn handle_key(
     targets_clone_for_send: Arc<Mutex<HashSet<SocketAddr>>>,
     ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
     secret: String,
+    progress_registry: Arc<ProgressRegistry>,
 ) {
     match key_event.code {
         KeyCode::Char('r') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -880,6 +1043,7 @@ async fn handle_key(
                             path,
                             file_id,
                             ack_map_clone,
+                            progress_registry,
                         )
                         .await
                         {
@@ -892,9 +1056,6 @@ async fn handle_key(
                     let _ = execute!(stdout, Clear(ClearType::All), cursor::MoveTo(0, 0));
                     std::process::exit(0);
                 } else {
-					
-					
-					
                     let targets_lock = targets.lock().await;
                     for &addr in targets_lock.iter() {
 						// ENCRYPT
@@ -973,7 +1134,7 @@ async fn handle_key(
 
 
 
-// ------------------- File Manager Task -------------------
+// -------------------- FILE MANAGER TASK --------------------
 async fn file_manager_task(
     mut rx: broadcast::Receiver<FileChunk>,
     chat_tx: broadcast::Sender<ChatLine>,
@@ -986,102 +1147,70 @@ async fn file_manager_task(
 ) {
     let state: Arc<Mutex<HashMap<u32, FileState>>> = Arc::new(Mutex::new(HashMap::new()));
     let completed_files: Arc<Mutex<HashSet<u32>>> = Arc::new(Mutex::new(HashSet::new()));
-
-    // --- Spawn stale transfer cleanup ---
-    {
-        let state = state.clone();
-        let file_transfers = file_transfers.clone();
-        let ack_tracker = ack_tracker.clone();
-
-        tokio::spawn(async move {
-            let timeout = Duration::from_millis(RECEIVE_TIMEOUT_MS);
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
-                let mut stale_ids = Vec::new();
-
-                {
-                    let state_guard = state.lock().await;
-                    for (&fid, entry) in state_guard.iter() {
-                        if now.duration_since(entry.last_seen) > timeout {
-                            stale_ids.push(fid);
-                        }
-                    }
-                }
-
-                for fid in stale_ids {
-                    if let Some(entry) = state.lock().await.remove(&fid) {
-                        let filename = entry.filename.clone();
-                        let done = entry.chunks.len() as u64;
-                        let total = entry.total_chunks.unwrap_or(done as u32) as u64;
-
-                        let mut ft = file_transfers.lock().await;
-                        ft.insert(
-                            filename.clone(),
-                            (done, total, TransferDirection::Download, TransferState::Failed),
-                        );
-
-                        let mut at = ack_tracker.lock().await;
-                        at.remove(&filename);
-                    }
-                }
-            }
-        });
-    }
-
     let mut last_redraw = Instant::now();
 
     while let Ok(chunk) = rx.recv().await {
-        // Skip completed files
+        let file_id = chunk.file_id;
+
+        // --- Skip completed files ---
         {
             let completed_guard = completed_files.lock().await;
-            if completed_guard.contains(&chunk.file_id) {
+            if completed_guard.contains(&file_id) {
                 continue;
             }
         }
 
-        // Insert or get file state
+        // --- Determine canonical filename from registry ---
+        let filename = {
+            let map_lock = registry.map.lock().await;
+            map_lock
+                .get(&file_id)
+                .map(|fp| fp.filename.clone())
+                .unwrap_or_else(|| chunk.filename.clone().unwrap_or_else(|| format!("file_{}", file_id)))
+        };
+
+        // --- Insert/get file state ---
         let mut state_guard = state.lock().await;
         let entry = state_guard
-                .entry(chunk.file_id)
-                .or_insert_with(|| FileState {
-                    filename: chunk.filename.clone().unwrap_or_default(),
-                    total_chunks: chunk.total_chunks,
-                    chunks: BTreeMap::new(),
-                    last_seen: Instant::now(),
-                });
-                
+            .entry(file_id)
+            .or_insert_with(|| FileState {
+                filename: filename.clone(),
+                total_chunks: chunk.total_chunks,
+                chunks: BTreeMap::new(),
+                last_seen: Instant::now(),
+            });
+
         entry.last_seen = Instant::now();
 
-        // Skip duplicate chunks
+        // --- Skip duplicate chunks ---
         if entry.chunks.contains_key(&chunk.chunk_index) {
             continue;
         }
 
-        // Buffer chunk
         entry.chunks.insert(chunk.chunk_index, chunk.payload.clone());
+        let unique_received = entry.chunks.len() as u64;
+        let total_chunks = entry.total_chunks.unwrap_or(0);
+        let file_chunks_clone = entry.chunks.clone(); // clone once for write later
+
+
+		if entry.chunks.len() == 1 { // first unique chunk
+			registry.ensure_progress(file_id, &filename, total_chunks.into()).await;
+		}
+		
+        drop(state_guard);
+        
+        // --- Update progress (only counts unique chunks) ---
+        // registry.update_progress(file_id, unique_received).await;
 
         // --- Update ACK tracker ---
         if let Some(src) = &chunk.src {
             let mut at = ack_tracker.lock().await;
-            at.entry(entry.filename.clone())
+            at.entry(filename.clone())
                 .or_insert_with(HashMap::new)
-                .entry(src.clone())
+                .entry(*src)
                 .or_insert_with(HashSet::new)
                 .insert(chunk.chunk_index);
         }
-
-        // --- Initialize progress bar if first chunk ---
-        if let Some(total_chunks) = chunk.total_chunks {
-            registry
-                .init_progress(chunk.file_id, &entry.filename, total_chunks)
-                .await;
-        }
-
-        // --- Update progress ---
-        registry.update_progress(&chunk).await;
 
         // --- Periodic redraw ---
         if last_redraw.elapsed() >= Duration::from_millis(100) {
@@ -1090,281 +1219,196 @@ async fn file_manager_task(
         }
 
         // --- Check for completion ---
-        if let Some(total) = entry.total_chunks {
-            if entry.chunks.len() as u32 == total {
-                completed_files.lock().await.insert(chunk.file_id);
+        let completed = unique_received >= total_chunks.into() && total_chunks > 0;
+        if completed {
+            completed_files.lock().await.insert(file_id);
 
-                let filename = entry.filename.clone();
-                let file_chunks = entry.chunks.clone();
-                let file_transfers = file_transfers.clone();
-                let chat_tx_clone = chat_tx.clone();
-                let transfer_counter = transfer_counter.clone();
-                let redraw_notify = redraw_notify.clone();
-                let state = state.clone();
-                let ack_tracker = ack_tracker.clone();
-                let forward_cache = forward_cache.clone();
-                let registry = registry.clone();
+            // Clone everything needed for the async blocking write
+            let file_transfers = file_transfers.clone();
+            let chat_tx_clone = chat_tx.clone();
+            let transfer_counter = transfer_counter.clone();
+            let redraw_notify = redraw_notify.clone();
+            let state = state.clone();
+            let ack_tracker = ack_tracker.clone();
+            let forward_cache = forward_cache.clone();
+            let registry = registry.clone();
+            let completed_files_clone = completed_files.clone();
+            let filename_for_write = filename.clone();
+            let file_chunks_for_write = file_chunks_clone.clone(); // clone for usage outside closure if needed
 
-                tokio::spawn(async move {
-                    // Reassemble file with preallocation
-                    let filename_clone_1 = filename.clone();
-                    let filename_clone_2 = filename.clone();
-                    let filename_clone_3 = filename.clone();
-                    let write_result = tokio::task::spawn_blocking(move || {
-                        let total_size: usize = file_chunks.values().map(|c| c.len()).sum();
-                        let mut file_data = Vec::with_capacity(total_size);
-                        file_data.resize(total_size, 0);
+            tokio::spawn(async move {
+                let write_chunks = file_chunks_clone; // move into closure
+                let filename_clone = filename_for_write.clone();
 
-                        let mut offset = 0;
-                        for i in 0..total {
-                            if let Some(c) = file_chunks.get(&i) {
-                                file_data[offset..offset + c.len()].copy_from_slice(c);
-                                offset += c.len();
-                            }
+                // Write file in blocking task
+                let write_result = tokio::task::spawn_blocking(move || {
+                    let total_size: usize = write_chunks.values().map(|c| c.len()).sum();
+                    let mut data = Vec::with_capacity(total_size);
+                    for i in 0..write_chunks.len() as u32 {
+                        if let Some(c) = write_chunks.get(&i) {
+                            data.extend_from_slice(c);
                         }
+                    }
+                    std::fs::write(&filename_clone, &data)
+                })
+                .await;
 
-                        std::fs::write(&filename_clone_1, &file_data)
-                    })
-                    .await;
+                if let Ok(Ok(_)) = write_result {
+                    // Update transfers
+                    let mut ft = file_transfers.lock().await;
+                    ft.insert(
+                        filename_for_write.clone(),
+                        (
+                            file_chunks_for_write.len() as u64,
+                            file_chunks_for_write.len() as u64,
+                            TransferDirection::Download,
+                            TransferState::Done,
+                        ),
+                    );
 
-                    if let Ok(Ok(_)) = write_result {
-                        let mut ft = file_transfers.lock().await;
-                        ft.insert(
-                            filename,
-                            (total as u64, total as u64, TransferDirection::Download, TransferState::Done),
-                        );
-
-                        let mut ctr = transfer_counter.lock().await;
-                        if *ctr > 0 {
-                            *ctr -= 1;
-                        }
-
-                        let _ = chat_tx_clone
-                            .send(ChatLine::Transfer {
-                                ts: Local::now(),
-                                id: chunk.file_id,
-                                filename: filename_clone_2,
-                                done: total as u64,
-                                total: total as u64,
-                                direction: TransferDirection::Download,
-                                state: TransferState::Done,
-                            });
-
-                        let _ = chat_tx_clone
-                            .send(ChatLine::Message {
-                                ts: Local::now(),
-                                msg: format!("Saved received file '{}'", filename_clone_3),
-                            });
-
-                        redraw_notify.notify_one();
-                    } else {
-                        eprintln!("Failed to write file {}", filename_clone_3);
+                    let mut ctr = transfer_counter.lock().await;
+                    if *ctr > 0 {
+                        *ctr -= 1;
                     }
 
-                    // --- Cleanup ---
-                    state.lock().await.remove(&chunk.file_id);
-                    ack_tracker.lock().await.remove(&filename_clone_3);
-                    forward_cache.lock().await.remove(&chunk.file_id);
-                    registry.map.lock().await.remove(&chunk.file_id);
-                });
-            }
+                    // Send chat notifications
+                    let _ = chat_tx_clone.send(ChatLine::Transfer {
+                        ts: Local::now(),
+                        id: file_id,
+                        filename: filename_for_write.clone(),
+                        done: file_chunks_for_write.len() as u64,
+                        total: file_chunks_for_write.len() as u64,
+                        direction: TransferDirection::Download,
+                        state: TransferState::Done,
+                    });
+
+                    let _ = chat_tx_clone.send(ChatLine::Message {
+                        ts: Local::now(),
+                        msg: format!("Saved received file '{}'", filename_for_write),
+                    });
+
+                    redraw_notify.notify_one();
+                } else {
+                    eprintln!("Failed to write file '{}'", filename_for_write);
+                }
+
+                // --- Cleanup ---
+                state.lock().await.remove(&file_id);
+                ack_tracker.lock().await.remove(&filename_for_write);
+                forward_cache.lock().await.remove(&file_id);
+                registry.remove(file_id).await;
+                completed_files_clone.lock().await.remove(&file_id);
+            });
         }
     }
 }
+
+
+
+
 
 
 
 
 // -------------------- SENDER: send_file uses broadcast receiver for ACKs --------------------
-async fn send_file(
+pub async fn send_file(
     socket: Arc<UdpSocket>,
     targets: Arc<Mutex<HashSet<SocketAddr>>>,
     path: String,
     file_id: u32,
     ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
+    registry: Arc<ProgressRegistry>,
 ) -> anyhow::Result<()> {
-    // Open file
     let mut file = File::open(&path).await?;
     let metadata = file.metadata().await?;
     let file_size = metadata.len();
 
-    let filename = Path::new(&path)
+    let filename = std::path::Path::new(&path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| format!("file_{ }", file_id));
+        .unwrap_or_else(|| format!("file_{}", file_id));
+	unsafe {
+		let chunk_size = WINDOW_SIZE;
+		let total_chunks = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
 
-    unsafe {
-        let chunk_size = WINDOW_SIZE;
-        let total_chunks = ((file_size + chunk_size as u64 - 1) / chunk_size as u64) as u32;
+		// Prepare chunks in memory
+		let mut chunks: Vec<FileChunk> = Vec::with_capacity(total_chunks as usize);
+		let mut buf = vec![0u8; chunk_size];
+		for chunk_index in 0..total_chunks {
+			let n = file.read(&mut buf).await?;
+			if n == 0 { break; }
 
-        // Read all chunks
-        let mut chunks: Vec<FileChunk> = Vec::with_capacity(total_chunks as usize);
-        let mut buf = vec![0u8; chunk_size];
-        for chunk_index in 0..total_chunks {
-            let n = file.read(&mut buf).await?;
-            if n == 0 {
-                break;     
-           
-            }
-            chunks.push(FileChunk {
-                file_id,
-                chunk_index,
-                total_chunks: if chunk_index == 0 { 
-                    Some(total_chunks)     
-                
-                } else { 
-                    None     
-                
-                },
-                filename: Some(filename.clone()),
-                payload: buf[..n].to_vec(),
-                src: None,
-           
-            });
-       
-        }
+			chunks.push(FileChunk {
+				file_id,
+				chunk_index,
+				total_chunks: if chunk_index == 0 { Some(total_chunks) } else { None },
+				filename: Some(filename.clone()),
+				payload: buf[..n].to_vec(),
+				src: None,
+			});
+		}
 
-        // Initialize per-client ACK tracking
-        let clients: Vec<SocketAddr> = {
-            let t = targets.lock().await;
-            t.iter().copied().collect()
-       
-        };
-        
-        {
+		// Snapshot of clients
+		let clients: Vec<SocketAddr> = {
+			let t = targets.lock().await;
+			t.iter().copied().collect()
+		};
+
+		// Initialize ACK map for this file
+		{
 			let mut ack_lock = ack_map.lock().await;
 			let mut fa = FileAck::new();
 			fa.init_clients(&clients);
 			ack_lock.insert(file_id, fa);
-        }
-       
-        
+		}
 
-        // Main sending loop
+		// --- Initialize single progress bar for this file ---
+		registry.ensure_progress(file_id, &filename, total_chunks as u64).await;
 
-        for client in &clients {
-			for chunk in &chunks {
-				
-				let chunk_index = chunk.chunk_index;
-				let mut maximum = MAX_RETRIES;
+		// --- Main sending loop ---
+		for chunk in &chunks {
+			for client in &clients {
+				let mut retries_left = MAX_RETRIES;
+				let mut backoff = Duration::from_millis(BASE_RETRY_MS);
+				let max_backoff = Duration::from_secs(1);
 
 				loop {
+					// Check if client already ACKed this chunk
 					{
-						// lock only while checking ack status
 						let ack_lock = ack_map.lock().await;
-
 						if let Some(fa) = ack_lock.get(&file_id) {
-							if fa.acked(*client, chunk_index) {
-								break; // already acked → no need to resend
+							if fa.acked(*client, chunk.chunk_index) {
+								break;
 							}
 						}
-					} // <-- lock is dropped here before awaiting send_to/sleep
+					}
 
-					// not acked yet, try sending
+					// Send chunk
 					let _ = socket.send_to(&chunk.to_bytes(), client).await;
 
-					maximum -= 1;
-					if maximum == 0 {
+					// Update progress bar only on first send attempt for this chunk
+					registry.update_progress(file_id, chunk.chunk_index as u64 + 1).await;
+
+					retries_left -= 1;
+					if retries_left == 0 {
+						eprintln!(
+							"Chunk {} of file {} reached max retries for {}",
+							chunk.chunk_index, file_id, client
+						);
 						break;
 					}
 
-					// Sleep briefly before retrying
-					sleep(Duration::from_millis(50)).await;
-				}
-				if maximum == 0{
-					break;
+					sleep(backoff).await;
+					backoff = std::cmp::min(backoff * 2, max_backoff);
 				}
 			}
 		}
-    }
+	}
     Ok(())
-
 }
 
-/// Spawn a robust File Transfer Manager responsible for resending chunks,
-/// tracking per-chunk retries, and removing peers that exceed retries.
-/// This centralizes forward_cache + ack_map logic to avoid race conditions.
-fn spawn_file_transfer_manager(
-    socket: Arc<UdpSocket>,
-    forward_cache: Arc<Mutex<HashMap<u32, HashMap<u32, FileChunk>>>>,
-    ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
-    targets: Arc<Mutex<HashSet<SocketAddr>>>,
-) {
-    tokio::spawn(async move {
-        use std::collections::HashMap as StdHashMap;
-        let mut retry_counts: StdHashMap<(u32, u32, SocketAddr), usize> = StdHashMap::new();
 
-        
-        // snapshot targets
-        let peers: Vec<SocketAddr> = {
-            let tg = targets.lock().await;
-            tg.iter().copied().collect()
-        };
 
-        // snapshot chunks
-        let chunks: Vec<(u32, u32, FileChunk)> = {
-            let cache = forward_cache.lock().await;
-            cache
-                .iter()
-                .flat_map(|(&fid, inner)| {
-                    inner.iter().map(move |(&idx, chunk)| (fid, idx, chunk.clone()))
-                })
-                .collect()
-        };
-
-        for (fid, idx, chunk) in chunks {
-            // who has acked this chunk already?
-            let acked_peers: Vec<SocketAddr> = {
-				let map = ack_map.lock().await;
-				map.get(&fid)
-					.map(|ack| {
-						ack.per_client.iter()
-						   .filter_map(|(p, done)| if done.contains(&idx) { Some(*p) } else { None })
-						   .collect()
-					})
-					.unwrap_or_default()
-			};
-
-            // send to peers who haven't acked
-            for peer in peers.iter().filter(|p| !acked_peers.contains(p)) {
-                let key = (fid, idx, *peer);
-                let retries = retry_counts.get(&key).cloned().unwrap_or(0);
-
-                if retries < MAX_RETRIES {
-                    let data = chunk.to_bytes();
-                    let _ = socket.send_to(&data, peer).await;
-                    retry_counts.insert(key, retries + 1);
-                } else {
-                    //eprintln!(
-                    //    "Dropping peer {} for file {} chunk {} after {} retries",
-                    //    peer, fid, idx, MAX_RETRIES
-                    //);
-                }
-            }
-        }
-
-        // cleanup: drop fully acked chunks
-        {
-            let mut cache = forward_cache.lock().await;
-            let map = ack_map.lock().await;
-            for (&fid, chunks_map) in cache.iter_mut() {
-                chunks_map.retain(|&idx, _| {
-                    if let Some(acks) = map.get(&fid) {
-                        let all_done = peers.iter().all(|p| {
-                            acks.per_client
-                                .get(p)
-                                .map(|s| s.contains(&idx))
-                                .unwrap_or(false)
-                        });
-                        !all_done
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
-    });
-}
 
 // -------------------- RECEIVER --------------------
 async fn spawn_receiver(
@@ -1411,11 +1455,9 @@ async fn spawn_receiver(
                     src,
                     &socket,
                     &file_chunk_tx,
-                    &targets,
                     server_mode,
                     &progress_registry,
                     &forward_cache,
-                    ack_map.clone(),
                 )
                 .await;
             }
@@ -1514,43 +1556,44 @@ async fn try_handle_chat(
     true
 }
 
-async fn try_handle_ack(
+pub async fn try_handle_ack(
     ack_buf: &[u8],
     src_addr: SocketAddr,
     ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
     registry: Arc<ProgressRegistry>,
 ) -> bool {
-    // --- Validate ACK packet ---
+    // --- Validate prefix ---
     if ack_buf.len() < 3 || &ack_buf[..3] != ACK_PREFIX {
         return false;
     }
 
+    // --- Parse ACK ---
     let ack = match AckPacket::from_bytes(&ack_buf[3..]) {
         Some(a) => a,
         None => return false,
     };
 
-    // --- Update ACK tracking ---
+    // --- Update ACK state ---
     let mut ack_lock = ack_map.lock().await;
-    let file_acks = ack_lock.entry(ack.file_id).or_insert_with(FileAck::new);
+    let file_acks = ack_lock.entry(ack.file_id).or_default();
+
     let is_new = file_acks.acknowledge(src_addr, ack.chunk_index);
     if !is_new {
-        return false;
+        return false; // duplicate ack
     }
 
-    // --- Update progress bar ---
-    let mut map_lock = registry.map.lock().await;
-    if let Some(entry) = map_lock.get_mut(&ack.file_id) {
-        entry.pb.inc(1);
+    // --- Count unique chunks and total raw ACKs ---
+    let unique_received = file_acks.min_acked() as u64;
 
-        let total_chunks = entry.total_chunks;
-        if file_acks.min_acked() as u32 >= total_chunks {
-            entry.pb.finish_with_message("Upload Completed");
-        }
-    }
+    registry
+        .update_progress(ack.file_id, unique_received)
+        .await;
 
     true
 }
+
+
+
 
 
 async fn try_handle_file_chunk(
@@ -1558,65 +1601,118 @@ async fn try_handle_file_chunk(
     src: SocketAddr,
     socket: &Arc<UdpSocket>,
     file_chunk_tx: &broadcast::Sender<FileChunk>,
-    targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     server_mode: bool,
-    progress_registry: &ProgressRegistry,
-    forward_cache: &ChunkCache,
-    ack_map: Arc<Mutex<HashMap<u32, FileAck>>>,
+    registry: &Arc<ProgressRegistry>,
+    forward_cache: &Arc<Mutex<HashMap<u32, HashMap<u32, FileChunk>>>>,
 ) -> bool {
-
-    if buf.len() < 3
-        || &buf[..3] == MSG_PREFIX
-        || &buf[..3] == ACK_PREFIX
-    {
+    // Validate prefix
+    if buf.len() < 3 || &buf[..3] == MSG_PREFIX || &buf[..3] == ACK_PREFIX {
         return false;
     }
 
-    // Parse incoming chunk
+    // Parse chunk
     let chunk = match FileChunk::from_bytes(buf, src) {
         Some(c) => c,
         None => return false,
     };
 
-    // Send ACK back to sender
+    // --- Deduplicate: insert only once into forward_cache (so duplicates are ignored) ---
+    let mut cache_lock = forward_cache.lock().await;
+    let file_chunks = cache_lock.entry(chunk.file_id).or_default();
+    let is_new = file_chunks.insert(chunk.chunk_index, chunk.clone()).is_none();
+    drop(cache_lock); // release immediately
+
+    if !is_new {
+        // Duplicate packet: we've already seen this chunk, do not re-ACK, do not re-forward.
+        // Optionally log / metrics here:
+        // trace!("Duplicate chunk {} for file {} from {}", chunk.chunk_index, chunk.file_id, src);
+        return true;
+    }
+
+    // --- Send ACK back to the immediate sender (only on the first seen) ---
     let ack = AckPacket {
         file_id: chunk.file_id,
         chunk_index: chunk.chunk_index,
     };
-        
-    let mut formated_ack = ACK_PREFIX.to_vec();
-    formated_ack.extend(&ack.to_bytes());
-     
-    let _ = socket.send_to(&formated_ack, src).await;
-    
-    // Log the full packet in hex for debugging
-	//eprintln!("Sent ACK packet: {:02X?}", formated_ack);
+    let mut formatted_ack = ACK_PREFIX.to_vec();
+    formatted_ack.extend(&ack.to_bytes());
+    let _ = socket.send_to(&formatted_ack, src).await;
 
-	// Optional: log human-readable info
-	//eprintln!("ACK details: file_id={}, chunk_index={}", ack.file_id, ack.chunk_index);
-    
-    // Save chunk into forward_cache for later resends
-    if server_mode {
-        let mut cache_lock = forward_cache.lock().await;
-        let file_chunks = cache_lock.entry(chunk.file_id).or_default();
-        file_chunks.insert(chunk.chunk_index, chunk.clone());
-        
-        // Forward to other clients immediately if server mode        
-		spawn_file_transfer_manager(
-			socket.clone(),
-			forward_cache.clone(),
-			ack_map.clone(),
-			targets.clone(),
-		)
+    // --- Initialize/update registry progress (first-seen chunk) ---
+	if let Some(total_chunks) = chunk.total_chunks {
+		// Look up known filename if progress already exists
+		let known_filename = {
+			let lock = registry.map.lock().await;
+			lock.get(&chunk.file_id)
+				.map(|fp| fp.filename.clone())
+				.unwrap_or_else(|| {
+					chunk.filename
+						.clone()
+						.unwrap_or_else(|| format!("file_{}", chunk.file_id))
+				})
+		};
+
+		registry
+			.ensure_progress(chunk.file_id, &known_filename, total_chunks.into())
+			.await;
 	}
-	
-    // Update progress bar
-    progress_registry.update_progress(&chunk).await;
 
-    // Deliver downstream to other tasks
+    // update progress by counting unique stored chunks (unique_received)
+    let unique_received = {
+        let cache = forward_cache.lock().await;
+        cache.get(&chunk.file_id).map(|m| m.len() as u64).unwrap_or(0)
+    };
+    //registry.update_progress(chunk.file_id, unique_received).await;
+
+    // --- Deliver downstream to other tasks (broadcast once) ---
     let _ = file_chunk_tx.send(chunk);
 
     true
+}
+
+
+
+
+
+// Redraw the input line and chat messages (above MultiProgress bars)
+async fn redraw_input_and_chat(
+    stdout: &mut std::io::Stdout,
+    chat_lines: &[ChatLine],
+    input_buffer: &str,
+    search_mode: bool,
+    search_buffer: &str,
+) {
+    let (cols, _rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+    // --- Draw chat lines starting from row 1 ---
+    for (i, entry) in chat_lines.iter().enumerate() {
+        let line_str = entry.to_string(); // uses Display impl
+        let truncated: String = line_str.chars().take(cols as usize).collect();
+
+        crossterm::queue!(
+            stdout,
+            crossterm::cursor::MoveTo(0, (i + 1) as u16),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+            crossterm::style::Print(truncated)
+        ).unwrap();
+    }
+
+    // --- Draw input line at row 0 ---
+    let prompt = if search_mode {
+        format!("(reverse-i-search)`{}': {}", search_buffer, input_buffer)
+    } else {
+        format!("> {}", input_buffer)
+    };
+    let truncated_prompt: String = prompt.chars().take(cols as usize).collect();
+
+    crossterm::queue!(
+        stdout,
+        crossterm::cursor::MoveTo(0, 0),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+        crossterm::style::Print(truncated_prompt)
+    ).unwrap();
+
+    stdout.flush().unwrap();
 }
 
 // -------------------- TERMINAL LOOP --------------------
@@ -1630,6 +1726,7 @@ async fn terminal_loop(args: TerminalArgs) {
         chat_rx,
         ack_map,
         secret,
+        progress_registry,
     } = args;
 
     let _guard = TerminalGuard::new();
@@ -1651,8 +1748,6 @@ async fn terminal_loop(args: TerminalArgs) {
     let (_cols, rows) = size().unwrap_or((100, 30));
     let visible_rows = rows.saturating_sub(1) as usize;
 
-    const HISTORY_LIMIT_TERMINAL: usize = 1000;
-
     loop {
         tokio::select! {
             // ---- Chat messages ----
@@ -1672,17 +1767,12 @@ async fn terminal_loop(args: TerminalArgs) {
                         }
                         redraw_notify.notify_one();
                     },
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("Missed {} chat messages", n);
-                    },
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        eprintln!("Chat channel closed");
-                        break;
-                    },
+                    Err(Lagged(_)) => {},
+                    Err(Closed) => break,
                 }
             }
 
-            // ---- Redraw terminal ----
+            // ---- Redraw terminal + MultiProgress bars ----
             _ = redraw_notify.notified() => {
                 if visible_scroll_offset > desired_scroll_offset {
                     visible_scroll_offset = visible_scroll_offset.saturating_sub(scroll_step);
@@ -1690,20 +1780,55 @@ async fn terminal_loop(args: TerminalArgs) {
                     visible_scroll_offset += scroll_step;
                 }
 
+                // --- Draw input line and chat messages ---
                 let chat_snapshot = {
                     let chat_lock = chat_lines.lock().await;
                     chat_lock.clone()
                 };
-
-                redraw_terminal(
+                redraw_input_and_chat(
                     &mut stdout,
                     &chat_snapshot,
-                    &file_transfers,
                     &input_buffer,
                     search_mode,
-                    &search_buffer,
-                    visible_scroll_offset,
+                    &search_buffer
                 ).await;
+
+                // --- Snapshot of all progress bars ---
+                let progress_snapshot: Vec<FileProgressSnapshot> = {
+					let map_lock = progress_registry.map.lock().await;
+					map_lock.values().map(|pb_entry| FileProgressSnapshot {
+							filename: pb_entry.filename.clone(),
+							unique_pos: pb_entry.pb_unique.position(),
+							unique_len: pb_entry.pb_unique.length().unwrap(),
+							raw_pos: pb_entry.pb_raw.position(),
+							state: pb_entry.state,
+					}).collect()
+				};
+
+                // --- Render progress bars ---
+                for snap in progress_snapshot {
+                    // Unique chunks bar
+                    let unique_bar = format!(
+                        "{} [unique] {bar:40} {pos}/{len}",
+                        snap.filename,
+                        bar = "#".repeat(snap.unique_pos as usize).chars().take(40).collect::<String>(),
+                        pos = snap.unique_pos,
+                        len = snap.unique_len,
+                    );
+                    println!("{}", unique_bar);
+
+                    // Raw spinner bar (uncapped)
+                    let spinner_idx = (snap.raw_pos % 4) as usize;
+                    let spinner_chars = ["⠁", "⠂", "⠄", "⡀"];
+                    println!("{} [raw]    {} {} ACKs", snap.filename, spinner_chars[spinner_idx], snap.raw_pos);
+
+                    // Optional finish messages
+                    match snap.state {
+                        TransferState::Done => println!("{} - Done", snap.filename),
+                        TransferState::Failed => println!("{} - FAILED", snap.filename),
+                        _ => {}
+                    }
+                }
             }
 
             // ---- Key events ----
@@ -1716,13 +1841,36 @@ async fn terminal_loop(args: TerminalArgs) {
                             _ => {},
                         }
 
-                        handle_key(key_event, &mut input_buffer, &chat_lines, &socket, &targets, &redraw_notify, &transfer_counter, &mut history, &mut search_result_index, &mut search_mode, &mut search_buffer, &mut history_index, &mut desired_scroll_offset, visible_rows, socket.clone(), targets.clone(), ack_map.clone(), secret.clone()).await;
+                        handle_key(
+                            key_event,
+                            &mut input_buffer,
+                            &chat_lines,
+                            &socket,
+                            &targets,
+                            &redraw_notify,
+                            &transfer_counter,
+                            &mut history,
+                            &mut search_result_index,
+                            &mut search_mode,
+                            &mut search_buffer,
+                            &mut history_index,
+                            &mut desired_scroll_offset,
+                            visible_rows,
+                            socket.clone(),
+                            targets.clone(),
+                            ack_map.clone(),
+                            secret.clone(),
+                            progress_registry.clone(),
+                        ).await;
                     }
                 }
             }
         }
     }
 }
+
+
+
 
 async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -1745,10 +1893,20 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let forward_cache: ChunkCache = Arc::new(Mutex::new(HashMap::new()));
     let ack_map: Arc<Mutex<HashMap<u32, FileAck>>> = Arc::new(Mutex::new(HashMap::new()));
     // Create a shared MultiProgress
-	let multi = Arc::new(MultiProgress::new());
+	
+	let (cols, _rows) = terminal::size().expect("ERROR: teminal size is weird"); 
+
+	// Create a Term for stderr (or stdout). We'll tell MultiProgress not to use the last row.
+    let term = Term::stderr();
+
+    // Create a custom draw target that uses this term
+    let draw_target = ProgressDrawTarget::term(term, (cols as u16).try_into().unwrap());
+
+    // MultiProgress with custom draw target
+    let multi_arc = Arc::new(MultiProgress::with_draw_target(draw_target));
 
 	// Create the registry (internally creates an empty FileProgressMap)
-	let progress_registry = Arc::new(ProgressRegistry::new(multi.clone()));
+	let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));
 
     let (file_chunk_tx, _) = broadcast::channel::<FileChunk>(1024);
     let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
@@ -1783,8 +1941,19 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         chat_rx: Arc::new(Mutex::new(chat_tx.subscribe())),
         ack_map: ack_map.clone(),
         secret: cli.secret.clone(),
+        progress_registry: progress_registry.clone(),
     };
     tokio::spawn(async move { terminal_loop(terminal_args).await });
+
+	// Initialize FileTransferManager
+	let file_transfer_manager = Arc::new(FileTransferManager::new(
+		arc_socket.clone(),
+		forward_cache.clone(),
+		ack_map.clone(),
+		clients.clone(),
+		progress_registry.clone(),
+	));
+	file_transfer_manager.start();
 
     // ---------------- File manager task ----------------
     let chat_tx_clone = chat_tx.clone();
@@ -1885,6 +2054,8 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
             let targets_tx_clone = targets_tx.clone();
             let forward_cache_clone = forward_cache.clone();
             let secret = cli.secret.clone();
+            
+            
 
             receiver_handle = tokio::spawn(async move {
                 spawn_receiver(
@@ -1918,19 +2089,27 @@ async fn run_client(cli: Cli, server: String) {
     let ack_tracker: FileAckTracker = Arc::new(Mutex::new(HashMap::new()));
     let ack_map: Arc<Mutex<HashMap<u32, FileAck>>> = Arc::new(Mutex::new(HashMap::new()));
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("ERROR: Couldn't bind socket"));
-    let targets: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let clients: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let forward_cache: ChunkCache = Arc::new(Mutex::new(HashMap::new()));
     // Create a shared MultiProgress
-	let multi = Arc::new(MultiProgress::new());
+	let (cols, _rows) = terminal::size().expect("ERROR: teminal size is weird"); 
+
+	// Create a Term for stderr (or stdout). We'll tell MultiProgress not to use the last row.
+    let term = Term::stderr();
+
+    // Create a custom draw target that uses this term
+    let draw_target = ProgressDrawTarget::term(term, (cols as u16).try_into().unwrap());
+
+    // MultiProgress with custom draw target
+    let multi_arc = Arc::new(MultiProgress::with_draw_target(draw_target));
 
 	// Create the registry (internally creates an empty FileProgressMap)
-	let progress_registry = Arc::new(ProgressRegistry::new(multi.clone()));
+	let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));
 
     // ---------------- Populate initial targets ----------------
     {
         let ports = compute_possible_ports(&cli.secret.as_bytes(), cli.base_port, cli.port_range, 1);
-        let mut t = targets.lock().await;
+        let mut t = clients.lock().await;
         for port in ports {
             t.insert(format!("{}:{}", server, port).parse::<SocketAddr>().unwrap());
         }
@@ -1954,7 +2133,7 @@ async fn run_client(cli: Cli, server: String) {
 
     // ---------------- Periodically refresh targets ----------------
     {
-        let targets = targets.clone();
+        let clients = clients.clone();
         let server = server.clone();
         let secret_bytes = cli.secret.clone().into_bytes();
         let shared_rng = Arc::new(Mutex::new(StdRng::from_entropy()));
@@ -1966,7 +2145,7 @@ async fn run_client(cli: Cli, server: String) {
                 unsafe { WINDOW_SIZE = min(small_entropy, MAX_UDP_PAYLOAD - 1000) }
 
                 let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range, 1);
-                let mut t = targets.lock().await;
+                let mut t = clients.lock().await;
                 t.clear();
                 for port in ports {
                     t.insert(format!("{}:{}", server, port).parse::<SocketAddr>().unwrap());
@@ -1981,17 +2160,18 @@ async fn run_client(cli: Cli, server: String) {
     // ---------------- Terminal args ----------------
     let terminal_args = TerminalArgs {
         socket: socket.clone(),
-        targets: targets.clone(),
+        targets: clients.clone(),
         redraw_notify: redraw_notify.clone(),
         file_transfers: file_transfers.clone(),
         transfer_counter: transfer_counter.clone(),
         chat_rx: Arc::new(Mutex::new(chat_tx.subscribe())),
         ack_map: ack_map.clone(),
         secret: cli.secret.clone(),
+        progress_registry: progress_registry.clone(),
     };
     tokio::spawn(async move { terminal_loop(terminal_args).await });
 
-    let chat_tx_clone = chat_tx.clone();
+	let chat_tx_clone = chat_tx.clone();
     let file_chunk_rx = file_chunk_tx.subscribe();
     let forward_cache_clone = forward_cache.clone();
     let progress_registry_clone = progress_registry.clone();
