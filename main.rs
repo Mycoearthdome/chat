@@ -1037,9 +1037,6 @@ pub fn derive_port_from_period_multiple(
 	candidate_ports[sel]
 }
 
-/// Rotating port calculator (drop-in compatible with your earlier `compute_port`).
-/// Returns (port, handshake_string)
-/// Rotating port calculator (drop-in compatible with your earlier `compute_port`).
 /// Returns (port, handshake_string)
 pub fn compute_port(
 	secret_bytes: &[u8],
@@ -2479,120 +2476,135 @@ async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<tokio::n
 
 #[cfg(target_os = "linux")]
 pub async fn prune_gone_targets(
+    server_mode: bool,
     clients: Arc<tokio::sync::Mutex<HashSet<SocketAddr>>>,
-    shared_socket: Arc<tokio::sync::RwLock<Arc<tokio::net::UdpSocket>>>,
+    shared_socket: Option<Arc<tokio::sync::RwLock<Arc<tokio::net::UdpSocket>>>>,
+    socket_client: Option<Arc<tokio::net::UdpSocket>>,
+    shutdown_flag: Option<Arc<AtomicBool>>,
 ) {
-	
-    // Extract fd safely before spawning
-    let fd = {
-        let guard = shared_socket.read().await;
-        guard.as_ref().as_raw_fd()
-    };
-
-    unsafe {
-        let optval: libc::c_int = 1;
-        if libc::setsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::IP_RECVERR,
-            &optval as *const _ as *const _,
-            std::mem::size_of::<libc::c_int>() as _,
-        ) != 0
-        {
-            eprintln!(
-                "[ICMP][WARN] failed to enable IP_RECVERR: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-
     let targets = clients.clone();
 
-    tokio::spawn({
-        let targets = targets.clone();
-        async move {
-            let mut last_seen = std::collections::HashSet::new();
+    tokio::spawn(async move {
+        let mut last_seen = std::collections::HashSet::new();
 
-            loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+        loop {
+			if shutdown_flag.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false) {
+				// Short sleep before checking error queue
+				tokio::time::sleep(Duration::from_millis(25)).await;
+				continue
+			}
+            // Re-acquire the current active FD every cycle
+            let fd = if server_mode {
+                let shared_socket_guard = shared_socket.clone().unwrap();
+                let guard = shared_socket_guard.read().await;
+                guard.as_ref().as_raw_fd()
+            } else {
+                let guard = socket_client.clone().unwrap();
+                guard.as_ref().as_raw_fd()
+            };
 
-                let mut cmsg_buf = [0u8; 512];
-                let mut iov_buf = [0u8; 128];
-                let mut iov = libc::iovec {
-                    iov_base: iov_buf.as_mut_ptr() as *mut _,
-                    iov_len: iov_buf.len(),
-                };
-
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                msg.msg_iov = &mut iov;
-                msg.msg_iovlen = 1;
-                msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-                msg.msg_controllen = cmsg_buf.len();
-
-                let ret =
-                    unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
-
-                if ret < 0 {
-                    let errno = nix::errno::Errno::last();
-                    if errno != nix::errno::Errno::EAGAIN && errno != nix::errno::Errno::EWOULDBLOCK
-                    {
-                        eprintln!("[ICMP][ERR] recvmsg failed: {:?}", errno);
-                    }
-                    continue;
+            unsafe {
+                let optval: libc::c_int = 1;
+                if libc::setsockopt(
+                    fd,
+                    libc::SOL_IP,
+                    libc::IP_RECVERR,
+                    &optval as *const _ as *const _,
+                    std::mem::size_of::<libc::c_int>() as _,
+                ) != 0
+                {
+                    eprintln!(
+                        "[ICMP][WARN] failed to enable IP_RECVERR: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
+            }
 
-                unsafe {
-                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                    while !cmsg.is_null() {
-                        if (*cmsg).cmsg_level == libc::SOL_IP
-                            && (*cmsg).cmsg_type == libc::IP_RECVERR
-                        {
-                            let err_ptr =
-                                libc::CMSG_DATA(cmsg) as *const libc::sock_extended_err;
-                            if !err_ptr.is_null() {
-                                let err = *err_ptr;
-                                if err.ee_origin == libc::SO_EE_ORIGIN_ICMP as u8
-                                    && err.ee_type == 3
-                                    && (err.ee_code == 1 || err.ee_code == 3)
-                                {
-                                    let offender_ptr = (&err as *const _ as *const u8)
-                                        .add(std::mem::size_of::<libc::sock_extended_err>())
-                                        as *const libc::sockaddr_in;
-                                    if !offender_ptr.is_null() {
-                                        let offender = *offender_ptr;
-                                        let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                            offender.sin_addr.s_addr,
-                                        ));
-                                        let port = u16::from_be(offender.sin_port);
-                                        let sock = std::net::SocketAddr::new(
-                                            std::net::IpAddr::V4(ip),
-                                            port,
+            // Take snapshot of current targets
+            let target_snapshot = {
+                let mut guard = targets.lock().await;
+                guard.clone()
+            };
+
+            // Short sleep before checking error queue
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let mut cmsg_buf = [0u8; 512];
+            let mut iov_buf = [0u8; 128];
+            let mut iov = libc::iovec {
+                iov_base: iov_buf.as_mut_ptr() as *mut _,
+                iov_len: iov_buf.len(),
+            };
+
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
+            msg.msg_controllen = cmsg_buf.len();
+
+            let ret =
+                unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
+
+            if ret < 0 {
+                let errno = nix::errno::Errno::last();
+                if errno != nix::errno::Errno::EAGAIN && errno != nix::errno::Errno::EWOULDBLOCK {
+                    eprintln!("[ICMP][ERR] recvmsg failed: {:?}", errno);
+                }
+                continue;
+            }
+
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_IP
+                        && (*cmsg).cmsg_type == libc::IP_RECVERR
+                    {
+                        let err_ptr =
+                            libc::CMSG_DATA(cmsg) as *const libc::sock_extended_err;
+                        if !err_ptr.is_null() {
+                            let err = *err_ptr;
+                            if err.ee_origin == libc::SO_EE_ORIGIN_ICMP as u8
+                                && err.ee_type == 3
+                                && (err.ee_code == 1 || err.ee_code == 3)
+                            {
+                                let offender_ptr = (&err as *const _ as *const u8)
+                                    .add(std::mem::size_of::<libc::sock_extended_err>())
+                                    as *const libc::sockaddr_in;
+                                if !offender_ptr.is_null() {
+                                    let offender = *offender_ptr;
+                                    let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                        offender.sin_addr.s_addr,
+                                    ));
+                                    let port = u16::from_be(offender.sin_port);
+                                    let sock = std::net::SocketAddr::new(
+                                        std::net::IpAddr::V4(ip),
+                                        port,
+                                    );
+                                    if !last_seen.contains(&sock)
+                                        && target_snapshot.contains(&sock)
+                                    {
+                                        eprintln!(
+                                            "[ICMP][DROP] unreachable {}",
+                                            sock
                                         );
-
-                                        if !last_seen.contains(&sock) {
-                                            eprintln!("[ICMP][DROP] unreachable {}", sock);
-                                            last_seen.insert(sock);
-
-                                            // Lock in its own short async block
-                                            {
-                                                let targets_clone = targets.clone();
-                                                tokio::spawn(async move {
-                                                    let mut guard = targets_clone.lock().await;
-                                                    guard.remove(&sock);
-                                                });
-                                            }
-                                        }
+                                        last_seen.insert(sock);
+                                        let targets_clone = targets.clone();
+                                        tokio::spawn(async move {
+                                            let mut guard = targets_clone.lock().await;
+                                            guard.remove(&sock);
+                                        });
                                     }
                                 }
                             }
                         }
-                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
+                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                 }
             }
         }
     });
 }
+
 
 // -------------------- SERVER & CLIENT RUN --------------------
 async fn run_server(cli: Cli) -> anyhow::Result<()> {
@@ -2696,16 +2708,19 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         .await;
     });
     
-    let clients_clone = clients.clone();
-    let shared_socket_clone = shared_socket.clone();
+   
     
-    // ----------Automatic Pruning of DEAD clients--------------
-    tokio::spawn(async move { prune_gone_targets(clients_clone, shared_socket_clone).await });
-
     // ---------------- Receiver state ----------------
     let mut spawn_receiver_launched = false;
     let mut shutdown_flag = Arc::new(AtomicBool::new(false));
     let mut receiver_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {}); // placeholder
+    
+    let clients_clone = clients.clone();
+    let shared_socket_clone_opt = Some(shared_socket.clone());
+    let shutdown_flag_opt = Some(shutdown_flag.clone());
+    
+    // ----------Automatic Pruning of DEAD clients--------------
+    tokio::spawn(async move { prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await });
 
     // ---------------- Main loop ----------------
     loop {
@@ -2743,7 +2758,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
 			}
 
             // reset shutdown flag for new receiver
-            shutdown_flag = Arc::new(AtomicBool::new(false));
+            shutdown_flag.store(false, Ordering::Relaxed);
 
             // spawn new receiver
             let socket_clone = arc_socket.clone();
@@ -2944,7 +2959,13 @@ async fn run_client(cli: Cli, server: String) {
         )
         .await;
     });
-
+    
+    let clients_clone = clients.clone();
+    let socket_clone_opt = Some(socket.clone());
+    
+    // ----------Automatic Pruning of DEAD clients--------------
+    //tokio::spawn(async move { prune_gone_targets(false, clients_clone, None, socket_clone_opt, None).await });
+    
     // ---------------- Spawn receiver ----------------
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let forward_cache_clone_2 = forward_cache.clone();
