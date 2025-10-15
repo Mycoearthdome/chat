@@ -54,6 +54,7 @@ use tokio::{
 };
 
 #[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 use std::os::fd::AsRawFd;
 
 #[cfg(target_os = "linux")]
@@ -343,6 +344,51 @@ impl RetryInfo {
     /// Returns true if this retry record should be discarded (peer dropped or stuck).
     pub fn expired(&self) -> bool {
         self.first_sent.elapsed() > Duration::from_secs(3)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UdpPacket {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+    pub payload: Vec<u8>,
+}
+
+impl UdpPacket {
+    /// Try to decode raw bytes into a UDP packet.
+    /// Returns `Some(UdpPacket)` if successful, or `None` if malformed.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        // IPv4 minimum UDP header: 20 bytes IP + 8 bytes UDP = 28 bytes
+        if buf.len() < 28 {
+            return None;
+        }
+
+        // --- Parse IP header ---
+        let ip_header_len = ((buf[0] & 0x0F) * 4) as usize;
+        if buf.len() < ip_header_len + 8 {
+            return None;
+        }
+
+        let src_ip = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
+        let dst_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
+
+        // --- Parse UDP header ---
+        let udp_start = ip_header_len;
+        let src_port = u16::from_be_bytes([buf[udp_start], buf[udp_start + 1]]);
+        let dst_port = u16::from_be_bytes([buf[udp_start + 2], buf[udp_start + 3]]);
+        let length = u16::from_be_bytes([buf[udp_start + 4], buf[udp_start + 5]]) as usize;
+
+        if length < 8 || udp_start + length > buf.len() {
+            return None;
+        }
+
+        let payload = buf[udp_start + 8..udp_start + length].to_vec();
+
+        Some(Self {
+            src: SocketAddr::new(IpAddr::V4(src_ip), src_port),
+            dst: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
+            payload,
+        })
     }
 }
 
@@ -1881,70 +1927,68 @@ async fn spawn_receiver(
     forward_cache: ForwardCache,
     secret: String,
     shutdown_flag: Arc<AtomicBool>,
-    channel_registry: AckChannelRegistry,    
+    channel_registry: AckChannelRegistry,
+    mut udp_packet_rx: mpsc::Receiver<UdpPacket>,    
 ) {
-	//eprintln!("[RX/TASK] Receiver loop started");
-	
-    let mut buf = vec![0u8; MAX_UDP_PAYLOAD];
-
-    while !shutdown_flag.load(Ordering::Relaxed) {
-         match socket.recv_from(&mut buf).await {
-			Ok((len, src)) => {
-                // Clone inner state for async operations
-                let _targets_snapshot = {
-                    let guard = targets.lock().await;
-                    guard.clone()
-                };
-                
-                if buf.starts_with(HELLO_PREFIX) {
-					update_targets(src, &targets, &targets_tx, server_mode).await;
-					//eprintln!("[HELLO] registered new peer {:?}", src);
-					continue;
-				}
+	loop {
+		while let Some(packet) = udp_packet_rx.recv().await {
+			// Clone inner state for async operations
+			let _targets_snapshot = {
+				let guard = targets.lock().await;
+				guard.clone()
+			};
+					
+			if packet.payload.starts_with(HELLO_PREFIX) {
+				let src = packet.src;
+				update_targets(src, &targets, &targets_tx, server_mode).await;
+				//eprintln!("[HELLO] registered new peer {:?}", src);
+				continue;
+			} else if packet.payload.starts_with(MSG_PREFIX) {
+				let src = packet.src;
+				update_targets(src, &targets, &targets_tx, server_mode).await;
 				
-                update_targets(src, &targets, &targets_tx, server_mode).await;
-				//eprintln!("INSIDE-->{}", String::from_utf8_lossy(&buf[..len]));
-				
-                try_handle_chat(
-                    &buf[..len],
-                    src,
-                    &chat_tx,
-                    &socket,
-                    &targets,
-                    server_mode,
-                    secret.clone(),
-                ).await;
-                
-                try_handle_ack(
-					&buf[..len],
-					src,
-					ack_map.clone(),
-					channel_registry.clone(),
-					progress_registry.clone(),
-					&socket,
-					&targets,
-				).await;
+				try_handle_chat(
+						packet,
+						src,
+						&chat_tx,
+						&socket,
+						&targets,
+						server_mode,
+						secret.clone(),
+					).await;
+			} else if packet.payload.starts_with(ACK_PREFIX) {
+				let src = packet.src;
+				update_targets(src, &targets, &targets_tx, server_mode).await;
+					
+					try_handle_ack(
+						packet,
+						src,
+						ack_map.clone(),
+						channel_registry.clone(),
+						progress_registry.clone(),
+						&socket,
+						&targets,
+					).await;
+			} else if packet.payload.starts_with(DATA_PREFIX) {
+				let src = packet.src;
+				update_targets(src, &targets, &targets_tx, server_mode).await;
 
-                try_handle_file_chunk(
-                    &buf[..len],
-                    src,
-                    &socket,
-                    &file_chunk_tx,
-                    server_mode,
-                    &progress_registry,
-                    &forward_cache,
-                    &ack_map,
-                    &targets,
-                ).await;
-            }
-            Err(_) => {
-				tokio::time::sleep(Duration::from_millis(50)).await;
-                // no packet received; loop continues
-            }
-        }
-    }
-
-    //eprintln!("Receiver task exited cleanly.");
+					try_handle_file_chunk(
+						packet,
+						src,
+						&socket,
+						&file_chunk_tx,
+						server_mode,
+						&progress_registry,
+						&forward_cache,
+						&ack_map,
+						&targets,
+					).await;
+			} else {
+				// discarded packet (dropped)
+			}
+		}
+	}
 }
 
 
@@ -1983,7 +2027,7 @@ async fn update_targets(
 }
 
 async fn try_handle_chat(
-    buf: &[u8],
+    packet: UdpPacket,
     src: SocketAddr,
     chat_tx: &broadcast::Sender<ChatLine>,
     socket: &UdpSocket,
@@ -1992,14 +2036,11 @@ async fn try_handle_chat(
     secret: String,
 ) -> bool {
 	
-	if buf.len() < 3 { return false; }
-    if &buf[..3] != MSG_PREFIX { return false; }
-    
     // Interpret the buffer as UTF-8 chat message
-    if let Ok(msg) = std::str::from_utf8(buf) {
+    if let Ok(msg) = std::str::from_utf8(&packet.payload) {
         // DECRYPT
         let handshake = HANDSHAKES[socket.local_addr().expect("Failed to get local address").port() as usize];
-        let decrypted = decrypt_string(&secret, &msg[3..], handshake).expect("ERROR: Decrypting the message failed!");
+        let decrypted = decrypt_string(&secret, &msg[MSG_PREFIX.len()..], handshake).expect("ERROR: Decrypting the message failed!");
         //eprintln!("DECRYPTED--->{}",decrypted);
         
         let chat_line = ChatLine::Message {
@@ -2020,7 +2061,7 @@ async fn try_handle_chat(
 					let handshake = HANDSHAKES[peer.port() as usize];
 					let encrypted = encrypt_string(&secret, &decrypted, handshake).expect("ERROR: Encrupting message failed");
 					
-					let mut buf_out = Vec::with_capacity(3 + encrypted.len());
+					let mut buf_out = Vec::with_capacity(MSG_PREFIX.len() + encrypted.len());
 					buf_out.extend_from_slice(MSG_PREFIX);
 					buf_out.extend_from_slice(encrypted.as_bytes());
 					
@@ -2034,7 +2075,7 @@ async fn try_handle_chat(
 
 
 pub async fn try_handle_ack(
-    ack_buf: &[u8],
+    packet: UdpPacket,
     src_addr: std::net::SocketAddr,
     ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>>,
     channel_registry: AckChannelRegistry,
@@ -2042,15 +2083,10 @@ pub async fn try_handle_ack(
     socket: &Arc<UdpSocket>,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
 ) -> bool {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    // Sanity check
-    if ack_buf.len() < 3 || &ack_buf[..3] != ACK_PREFIX {
-        return false;
-    }
+    
 
     // Decode ACK packet
-    let ack = match AckPacket::from_bytes(&ack_buf[3..]) {
+    let ack = match AckPacket::from_bytes(&packet.payload[ACK_PREFIX.len()..]) {
         Some(a) => a,
         None => {
             eprintln!("[ACK] malformed from {}", src_addr);
@@ -2164,7 +2200,7 @@ pub async fn try_handle_ack(
 
 /// Handle incoming FileChunk packets, send ACK (even for duplicates), and optionally forward.
 async fn try_handle_file_chunk(
-    buf: &[u8],
+    packet: UdpPacket,
     src: SocketAddr,
     socket: &Arc<UdpSocket>,
     file_chunk_tx: &mpsc::Sender<FileChunk>,
@@ -2174,19 +2210,11 @@ async fn try_handle_file_chunk(
     ack_map: &AckMap,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
 ) -> bool {
-    // --- Basic validation ---
-    if buf.len() < 3 || &buf[..3] != DATA_PREFIX {
-        return false;
-    }
-
+	
     // --- Decode chunk ---
-    let mut chunk = match FileChunk::from_bytes(&buf[DATA_PREFIX.len()..]) {
+    let mut chunk = match FileChunk::from_bytes(&packet.payload[DATA_PREFIX.len()..]) {
         Some(c) => c,
         None => {
-            eprintln!(
-                "[RX][ERROR] FileChunk::from_bytes failed fid? raw[0..16]={:?}",
-                &buf[DATA_PREFIX.len()..DATA_PREFIX.len() + 16.min(buf.len())]
-            );
             return false;
         }
     };
@@ -2474,6 +2502,56 @@ async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<tokio::n
 	return Ok(bind_udp(format!("{}:{}", addr, port).parse::<std::net::SocketAddr>().unwrap().into())?);
 }
 
+async fn lock_first_raw_fd(
+    shared_socket: Arc<tokio::sync::RwLock<Arc<tokio::net::UdpSocket>>>,
+    tx_raw_udp_packet: mpsc::Sender<UdpPacket>,
+) {
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        let mut lockdown = false;
+        let mut fd: RawFd = -1;
+        let mut consecutive_eagain = 0u32;
+
+        loop {
+            if !lockdown {
+                let guard = shared_socket.read().await;
+                fd = guard.as_ref().as_raw_fd();
+                lockdown = true;
+                eprintln!("[RAW] Locked UDP FD = {}", fd);
+            }
+
+            let ret = unsafe {
+                libc::recv(
+                    fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+
+            if ret < 0 {
+                consecutive_eagain += 1;
+                if consecutive_eagain % 1000 == 0 {
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
+
+            consecutive_eagain = 0;
+
+            if let Some(packet) = UdpPacket::from_bytes(&buf[..ret as usize]) {
+                if tx_raw_udp_packet.send(packet).await.is_err() {
+                    eprintln!("[RAW] Channel closed — stopping");
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_micros(100)).await;
+        }
+    });
+}
+	
+	
+
 #[cfg(target_os = "linux")]
 pub async fn prune_gone_targets(
     server_mode: bool,
@@ -2483,7 +2561,8 @@ pub async fn prune_gone_targets(
     shutdown_flag: Option<Arc<AtomicBool>>,
 ) {
     let targets = clients.clone();
-
+	let mut lockdown = false;
+	
     tokio::spawn(async move {
         let mut last_seen = std::collections::HashSet::new();
 
@@ -2491,6 +2570,7 @@ pub async fn prune_gone_targets(
 			if shutdown_flag.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false) {
 				// Short sleep before checking error queue
 				tokio::time::sleep(Duration::from_millis(25)).await;
+				lockdown = true;
 				continue
 			}
             // Re-acquire the current active FD every cycle
@@ -2638,6 +2718,8 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
 	set_global_registries(progress_registry.clone());
 
     let (file_chunk_tx, file_chunk_rx) = mpsc::channel::<FileChunk>(8192);
+    let (udp_packet_tx, udp_packet_rx) = mpsc::channel::<UdpPacket>(8192);
+    
     let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
 
     let secret_bytes = cli.secret.clone().into_bytes();
@@ -2660,8 +2742,13 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
             .expect("Cannot bind initial port"),
     );
     
+    let mut shutdown_flag = Arc::new(AtomicBool::new(false));
     let shared_socket = Arc::new(tokio::sync::RwLock::new(arc_socket.clone()));
-
+    let shared_socket_for_locking = shared_socket.clone();
+    
+    // ---------------- socket lock ----------------
+    tokio::spawn(async move { lock_first_raw_fd(shared_socket_for_locking, udp_packet_tx).await });
+    
     // ---------------- Terminal task ----------------
     let terminal_args = TerminalArgs {
         socket: arc_socket.clone(),
@@ -2711,16 +2798,48 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
    
     
     // ---------------- Receiver state ----------------
-    let mut spawn_receiver_launched = false;
-    let mut shutdown_flag = Arc::new(AtomicBool::new(false));
     let mut receiver_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {}); // placeholder
     
     let clients_clone = clients.clone();
     let shared_socket_clone_opt = Some(shared_socket.clone());
     let shutdown_flag_opt = Some(shutdown_flag.clone());
     
+    
     // ----------Automatic Pruning of DEAD clients--------------
     tokio::spawn(async move { prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await });
+    
+    // spawn new receiver
+    let socket_clone = arc_socket.clone();
+    let shutdown_clone = shutdown_flag.clone();
+    let chat_tx_clone = chat_tx.clone();
+    let file_chunk_tx_clone = file_chunk_tx.clone();
+    let ack_map_clone = ack_map.clone();
+    let progress_registry_clone = progress_registry.clone();
+    let clients_clone = clients.clone();
+    let targets_tx_clone = targets_tx.clone();
+    let forward_cache_clone = forward_cache.clone();
+    let secret = cli.secret.clone();
+    let channel_registry_clone = channel_registry.clone();
+
+    receiver_handle = tokio::spawn(async move {
+		spawn_receiver(
+			socket_clone,
+            chat_tx_clone,
+            file_chunk_tx_clone,
+            ack_map_clone,
+            progress_registry_clone,
+            clients_clone,
+            targets_tx_clone,
+            true,
+            forward_cache_clone,
+            secret,
+            shutdown_clone,
+            channel_registry_clone,
+            udp_packet_rx,
+            )
+            .await;
+	});
+
 
     // ---------------- Main loop ----------------
     loop {
@@ -2739,8 +2858,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         if new_port != current_port && new_port != cli.base_port {
             // signal old receiver to shutdown
             shutdown_flag.store(true, Ordering::Relaxed);
-            receiver_handle.await.expect("Receiver join failed");
-
+            
             // drop old socket
             drop(arc_socket);
 
@@ -2759,72 +2877,7 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
 
             // reset shutdown flag for new receiver
             shutdown_flag.store(false, Ordering::Relaxed);
-
-            // spawn new receiver
-            let socket_clone = arc_socket.clone();
-            let shutdown_clone = shutdown_flag.clone();
-            let chat_tx_clone = chat_tx.clone();
-            let file_chunk_tx_clone = file_chunk_tx.clone();
-            let ack_map_clone = ack_map.clone();
-            let progress_registry_clone = progress_registry.clone();
-            let clients_clone = clients.clone();
-            let targets_tx_clone = targets_tx.clone();
-            let forward_cache_clone = forward_cache.clone();
-            let secret = cli.secret.clone();
-            let channel_registry_clone = channel_registry.clone();
-
-            receiver_handle = tokio::spawn(async move {
-                spawn_receiver(
-                    socket_clone,
-                    chat_tx_clone,
-                    file_chunk_tx_clone,
-                    ack_map_clone,
-                    progress_registry_clone,
-                    clients_clone,
-                    targets_tx_clone,
-                    true,
-                    forward_cache_clone,
-                    secret,
-                    shutdown_clone,
-                    channel_registry_clone,
-                )
-                .await;
-            });
-        }
-
-        if !spawn_receiver_launched {
-            // spawn initial receiver
-            let socket_clone = arc_socket.clone();
-            let shutdown_clone = shutdown_flag.clone();
-            let chat_tx_clone = chat_tx.clone();
-            let file_chunk_tx_clone = file_chunk_tx.clone();
-            let ack_map_clone = ack_map.clone();
-            let progress_registry_clone = progress_registry.clone();
-            let clients_clone = clients.clone();
-            let targets_tx_clone = targets_tx.clone();
-            let forward_cache_clone = forward_cache.clone();
-            let secret = cli.secret.clone();
-            let channel_registry_clone = channel_registry.clone();
-            
-            receiver_handle = tokio::spawn(async move {
-                spawn_receiver(
-                    socket_clone,
-                    chat_tx_clone,
-                    file_chunk_tx_clone,
-                    ack_map_clone,
-                    progress_registry_clone,
-                    clients_clone,
-                    targets_tx_clone,
-                    true,
-                    forward_cache_clone,
-                    secret,
-                    shutdown_clone,
-                    channel_registry_clone,
-                )
-                .await;
-            });
-            spawn_receiver_launched = true;
-        }
+		}
     }
 }
 
@@ -2848,6 +2901,8 @@ async fn run_client(cli: Cli, server: String) {
     );
     
     //eprintln!("[CLIENT] Bound on {:?}", socket.local_addr().ok());
+    let mut shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shared_socket = Arc::new(tokio::sync::RwLock::new(socket.clone()));
     
     let clients: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let forward_cache: ForwardCache = new_forward_cache();
@@ -2882,6 +2937,11 @@ async fn run_client(cli: Cli, server: String) {
 
     // ---------------- Channels ----------------
     let (file_chunk_tx, file_chunk_rx) = mpsc::channel::<FileChunk>(8192);
+    let (udp_packet_tx, udp_packet_rx) = mpsc::channel::<UdpPacket>(8192);
+    
+    // ---------------- socket lock ----------------
+    tokio::spawn(async move { lock_first_raw_fd(shared_socket, udp_packet_tx).await });
+    
     let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
 
     // ---------------- Periodically refresh targets ----------------
@@ -2994,6 +3054,7 @@ async fn run_client(cli: Cli, server: String) {
                 secret.clone(),
                 shutdown_flag.clone(),
                 channel_registry.clone(),
+                udp_packet_rx,
             )
             .await;
         }
