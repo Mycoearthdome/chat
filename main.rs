@@ -6,9 +6,18 @@
 // Progress bar calls are preserved (commented out).
 
 use std::collections::HashMap;
+
+
+#[derive(Clone, Debug)]
+pub struct Handshake {
+    pub password: String,
+    pub handshake_str: String,
+}
+
 use std::sync::Arc;
 use dashmap::DashMap;
 use bytes::Bytes;
+use textwrap::fill;
 
 // === DashMap wiring (clean) ===
 
@@ -77,16 +86,13 @@ use std::{
 
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr, IpAddr};
 
-// Cryptography
-use sha2::{Sha256, Digest};
-use hkdf::Hkdf;
-
 // Terminal UI
 use crossterm::{
+    cursor::MoveTo,
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    //style::{Color, Print, ResetColor, SetForegroundColor},
+    style::{Color, PrintStyledContent, Stylize},
     terminal::{disable_raw_mode, enable_raw_mode, size, Clear, ClearType},
 	terminal,
 };
@@ -128,11 +134,15 @@ use rand::{rngs::StdRng, Rng, SeedableRng, thread_rng};
 use aes_gcm::{Aes256Gcm, Nonce, KeyInit};
 use base64::{engine::general_purpose, Engine as _};
 use aes_gcm::aead::{Aead};
+use hkdf::Hkdf;
+use sha2::{Sha256, Digest};
+use std::time::UNIX_EPOCH;
 
 
 // -------------------- CONSTANTS --------------------More at the bottom
 const MAX_UDP_PAYLOAD: usize = 65507;
 const HELLO_PREFIX: &[u8] = b"HEL";
+const HELLO_ACK_PREFIX: &[u8] = b"HAK";
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
 const DATA_PREFIX: &[u8] = b"DAT";
@@ -200,6 +210,50 @@ pub enum ChatLine {
 },
 
 }
+
+impl fmt::Display for ChatLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChatLine::Message { ts, msg } => {
+                write!(f, "[{}] {}", ts.format("%H:%M:%S"), msg)
+            }
+
+            ChatLine::Transfer {
+                ts,
+                filename,
+                done,
+                total,
+                direction,
+                state,
+                ..
+            } => {
+                let dir = match direction {
+                    TransferDirection::Upload => "↑",
+                    TransferDirection::Download => "↓",
+                };
+
+                let st = match state {
+                    TransferState::InProgress => "…",
+                    TransferState::Done => "✔",
+                    TransferState::Failed => "✘",
+                };
+
+                let bar = render_progress(*done, *total, 20);
+
+                write!(
+                    f,
+                    "[{}] {} {} {} {}",
+                    ts.format("%H:%M:%S"),
+                    dir,
+                    filename,
+                    bar,
+                    st
+                )
+            }
+        }
+    }
+}
+
 /// Snapshot of progress for safe terminal rendering
 struct FileProgressSnapshot {
     pub filename: String,
@@ -357,38 +411,12 @@ pub struct UdpPacket {
 impl UdpPacket {
     /// Try to decode raw bytes into a UDP packet.
     /// Returns `Some(UdpPacket)` if successful, or `None` if malformed.
-    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        // IPv4 minimum UDP header: 20 bytes IP + 8 bytes UDP = 28 bytes
-        if buf.len() < 28 {
-            return None;
+    pub fn from_socket(addr: SocketAddr, data: &[u8]) -> Self {
+        Self {
+            src: addr,
+            dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            payload: data.to_vec(),
         }
-
-        // --- Parse IP header ---
-        let ip_header_len = ((buf[0] & 0x0F) * 4) as usize;
-        if buf.len() < ip_header_len + 8 {
-            return None;
-        }
-
-        let src_ip = Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]);
-        let dst_ip = Ipv4Addr::new(buf[16], buf[17], buf[18], buf[19]);
-
-        // --- Parse UDP header ---
-        let udp_start = ip_header_len;
-        let src_port = u16::from_be_bytes([buf[udp_start], buf[udp_start + 1]]);
-        let dst_port = u16::from_be_bytes([buf[udp_start + 2], buf[udp_start + 3]]);
-        let length = u16::from_be_bytes([buf[udp_start + 4], buf[udp_start + 5]]) as usize;
-
-        if length < 8 || udp_start + length > buf.len() {
-            return None;
-        }
-
-        let payload = buf[udp_start + 8..udp_start + length].to_vec();
-
-        Some(Self {
-            src: SocketAddr::new(IpAddr::V4(src_ip), src_port),
-            dst: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
-            payload,
-        })
     }
 }
 
@@ -727,6 +755,7 @@ impl FileTransferManager {
 						data.extend_from_slice(DATA_PREFIX);
 						data.extend_from_slice(&chunk_fwd.to_bytes());
 
+        let target_port: u16 = resolve_target_port_for_send(&peer_addr);
 						if let Err(e) = socket_ref.send_to(&data, peer_addr).await {
 							eprintln!(
 								"[FANOUT][ERR] fid={} idx={} relay={} -> {} err={:?}",
@@ -788,51 +817,6 @@ fn render_progress(done: u64, total: u64, width: usize) -> String {
 
     format!("[{}] {}/{}", bar, done, total)
 }
-
-
-impl fmt::Display for ChatLine {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ChatLine::Message { ts, msg } => {
-                write!(f, "[{}] {}", ts.format("%H:%M:%S"), msg)
-            }
-
-            ChatLine::Transfer {
-                ts,
-                filename,
-                done,
-                total,
-                direction,
-                state,
-                ..
-            } => {
-                let dir = match direction {
-                    TransferDirection::Upload => "↑",
-                    TransferDirection::Download => "↓",
-                };
-
-                let st = match state {
-                    TransferState::InProgress => "…",
-                    TransferState::Done => "✔",
-                    TransferState::Failed => "✘",
-                };
-
-                let bar = render_progress(*done, *total, 20);
-
-                write!(
-                    f,
-                    "[{}] {} {} {} {}",
-                    ts.format("%H:%M:%S"),
-                    dir,
-                    filename,
-                    bar,
-                    st
-                )
-            }
-        }
-    }
-}
-
 
 // Shared progress map: file_id → progress bar & total chunks
 type FileProgressMap = Arc<Mutex<HashMap<u32, FileProgress>>>;
@@ -1180,26 +1164,102 @@ fn derive_nonce(plaintext: &str) -> [u8; NONCE_LEN] {
     nonce
 }
 
-fn encrypt_string(password: &str, plaintext: &str, handshake: &str) -> Result<String> {
-    let key_bytes = derive_key(password);
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
-    let nonce_bytes = derive_nonce(handshake);
+/// Deterministically derive a handshake from the shared secret and UDP port.
+/// No precomputation or global array needed.
+fn derive_handshake_for_port(secret_bytes: &[u8], port: u16) -> Handshake {
+    let salt = port.to_be_bytes();
+    let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
+    let mut pwd = [0u8; 32];
+    let mut hs  = [0u8; 32];
+    hk.expand(b"hs-password", &mut pwd).expect("HKDF expand pwd");
+    hk.expand(b"hs-string", &mut hs).expect("HKDF expand hs");
+    let password_b64 = general_purpose::URL_SAFE_NO_PAD.encode(pwd);
+    let hs_b64       = general_purpose::URL_SAFE_NO_PAD.encode(hs);
+    Handshake { password: password_b64, handshake_str: hs_b64 }
+}
+
+/// AES-GCM encrypt plaintext for a given port.
+/// Returns base64-URL-safe ciphertext.
+fn encrypt_for_port(
+    secret_bytes: &[u8],
+    target_port: u16,
+    plaintext: &str,
+) -> Result<String, aes_gcm::Error> {
+    let hs = derive_handshake_for_port(secret_bytes, target_port);
+
+    let key_bytes = derive_key(&hs.password);
+    // Safe unwrap — key is always 32 bytes
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes).expect("32-byte AES key");
+    let nonce_bytes = derive_nonce(&hs.handshake_str);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes()).unwrap();
+    let ciphertext = cipher.encrypt(nonce, plaintext.as_bytes())?;
     Ok(general_purpose::URL_SAFE_NO_PAD.encode(ciphertext))
 }
 
-fn decrypt_string(password: &str, ciphertext_b64: &str, handshake: &str) -> Result<String> {
+/// Try decrypting a base64 string by checking current, previous, and next
+/// rotation periods, each with its derived port handshake.
+fn try_decrypt_string_with_window(
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    ciphertext_b64: &str,
+    local_port: u16,
+) -> Option<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let current_period = now / HASH_PERIOD_SECS;
+
+    let mut candidate_ports = Vec::new();
+    // include local port (for static listening socket)
+    candidate_ports.push(local_port);
+
+    // add current, prev, next derived ports
+    for offset in [0i64, -1, 1] {
+        if let Some(period) = current_period.checked_add_signed(offset) {
+            candidate_ports.push(derive_port_from_period(secret_bytes, base_port, port_range, period));
+        }
+    }
+
+    for port in candidate_ports {
+        let hs = derive_handshake_for_port(secret_bytes, port);
+        if let Ok(plaintext) = decrypt_string(&hs.password, ciphertext_b64, &hs.handshake_str) {
+            return Some(plaintext);
+        }
+    }
+    None
+}
+
+fn decrypt_string(password: &str, ciphertext_b64: &str, handshake: &str) -> Result<String, Box<dyn std::error::Error>> {
     let key_bytes = derive_key(password);
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes)?;
+    let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+        .map_err(|_| "Invalid AES key length")?;
+
     let nonce_bytes = derive_nonce(handshake);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = general_purpose::URL_SAFE_NO_PAD.decode(ciphertext_b64)?;
-    let plaintext = cipher.decrypt(nonce, ciphertext.as_ref()).unwrap();
-    Ok(String::from_utf8(plaintext)?)
+    // Decode ciphertext from Base64
+    let ciphertext = general_purpose::URL_SAFE_NO_PAD
+        .decode(ciphertext_b64)
+        .map_err(|_| "Invalid base64 ciphertext")?;
+
+    // Decrypt safely
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_ref())
+        .map_err(|_| "AES-GCM decryption failed (bad key/nonce or tampered data)")?;
+
+    // Convert UTF-8 bytes to String
+    let result = String::from_utf8(plaintext)
+        .map_err(|_| "Plaintext is not valid UTF-8")?;
+
+    Ok(result)
 }
+
+// ---- Added: helper to resolve the destination UDP port for send paths ----
+#[inline]
+fn resolve_target_port_for_send(addr: &std::net::SocketAddr) -> u16 {
+    addr.port()
+}
+
 
 // -------------------- TERMINAL --------------------
 struct TerminalGuard;
@@ -1227,6 +1287,7 @@ async fn send_chat_message_to_target(
     let mut buf = Vec::with_capacity(3 + msg.len());
     buf.extend_from_slice(MSG_PREFIX);
     buf.extend_from_slice(msg.as_bytes());
+        let target_port: u16 = resolve_target_port_for_send(&target);
     socket.send_to(&buf, target).await?;
     Ok(())
 
@@ -1344,23 +1405,33 @@ async fn handle_key(
                 } else {
                     let targets_lock = targets.lock().await;
                     for &addr in targets_lock.iter() {
-						// ENCRYPT
-						let handshake = HANDSHAKES[addr.port() as usize];
-						let encrypted = encrypt_string(&secret, &input, handshake).expect("ERROR: Encrupting message failed");
-						
-						//SEND
-                        let _ = send_chat_message_to_target(socket.clone(), addr, &encrypted).await;
-                    }
-                    chat_push_cap(
-                        chat,
-                        ChatLine::Message {
-                            ts: Local::now(),
-                            msg: format!("You: {}", input),
-                        },
-                    )
-                    .await;
-                    redraw_notify.notify_one();
-                }
+						// Encrypt the outgoing message for this target port
+						let target_port = addr.port();
+						let encrypted = match encrypt_for_port(secret.as_bytes(), target_port, &input) {
+							Ok(ct) => ct,
+							Err(e) => {
+								eprintln!("[ERROR] encrypting message for {} failed: {}", addr, e);
+								continue; // Skip this target but keep others
+							}
+						};
+
+						// Send the encrypted message
+						if let Err(e) = send_chat_message_to_target(socket.clone(), addr, &encrypted).await {
+							eprintln!("[WARN] sending to {} failed: {}", addr, e);
+						}
+					}
+
+					// Push chat UI message
+					chat_push_cap(
+						chat,
+						ChatLine::Message {
+							ts: Local::now(),
+							msg: format!("You: {}", input),
+						},
+					)
+					.await;
+					redraw_notify.notify_one();
+				}
             }
         }
 
@@ -1834,6 +1905,7 @@ pub async fn send_file(
                                         let mut datagram = Vec::with_capacity(DATA_PREFIX.len() + encoded.len());
                                         datagram.extend_from_slice(DATA_PREFIX);
                                         datagram.extend_from_slice(&encoded);
+        let target_port: u16 = resolve_target_port_for_send(&peer);
                                         if socket.send_to(&datagram, peer).await.is_ok() {
                                             win.last_sent.insert(idx, Instant::now());
                                         }
@@ -1859,6 +1931,7 @@ pub async fn send_file(
                                         let mut datagram = Vec::with_capacity(DATA_PREFIX.len() + encoded.len());
                                         datagram.extend_from_slice(DATA_PREFIX);
                                         datagram.extend_from_slice(&encoded);
+        let target_port: u16 = resolve_target_port_for_send(&peer);
                                         if socket.send_to(&datagram, peer).await.is_ok() {
                                             win.in_flight += 1;
                                             win.last_sent.insert(idx, Instant::now());
@@ -1928,9 +2001,10 @@ async fn spawn_receiver(
     secret: String,
     shutdown_flag: Arc<AtomicBool>,
     channel_registry: AckChannelRegistry,
-    mut udp_packet_rx: mpsc::Receiver<UdpPacket>,    
+    mut udp_packet_rx: mpsc::Receiver<UdpPacket>,
+    base_port: u16,
+    port_range: u16,
 ) {
-	loop {
 		while let Some(packet) = udp_packet_rx.recv().await {
 			// Clone inner state for async operations
 			let _targets_snapshot = {
@@ -1942,6 +2016,15 @@ async fn spawn_receiver(
 				let src = packet.src;
 				update_targets(src, &targets, &targets_tx, server_mode).await;
 				//eprintln!("[HELLO] registered new peer {:?}", src);
+				
+				// --- HELLO handshake to client ---
+				let hello_ack_msg = HELLO_ACK_PREFIX;
+
+        let target_port: u16 = resolve_target_port_for_send(&src);
+				if let Err(e) = socket.send_to(hello_ack_msg, src).await {
+					eprintln!("[CLIENT] failed to send HELLO ACK to client: {:?}", e);
+				}
+				
 				continue;
 			} else if packet.payload.starts_with(MSG_PREFIX) {
 				let src = packet.src;
@@ -1955,6 +2038,8 @@ async fn spawn_receiver(
 						&targets,
 						server_mode,
 						secret.clone(),
+						base_port,
+						port_range,
 					).await;
 			} else if packet.payload.starts_with(ACK_PREFIX) {
 				let src = packet.src;
@@ -1984,11 +2069,11 @@ async fn spawn_receiver(
 						&ack_map,
 						&targets,
 					).await;
-			} else {
-				// discarded packet (dropped)
+			} else if packet.payload.starts_with(HELLO_ACK_PREFIX) {
+					let src = packet.src;
+					update_targets(src, &targets, &targets_tx, server_mode).await;
 			}
 		}
-	}
 }
 
 
@@ -2034,45 +2119,68 @@ async fn try_handle_chat(
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     server_mode: bool,
     secret: String,
+    base_port: u16,
+    port_range: u16,
 ) -> bool {
-	
-    // Interpret the buffer as UTF-8 chat message
+    // Convert secret string to bytes once
+    let secret_bytes = secret.as_bytes();
+
+    // Interpret buffer as UTF-8 chat message
     if let Ok(msg) = std::str::from_utf8(&packet.payload) {
-        // DECRYPT
-        let handshake = HANDSHAKES[socket.local_addr().expect("Failed to get local address").port() as usize];
-        let decrypted = decrypt_string(&secret, &msg[MSG_PREFIX.len()..], handshake).expect("ERROR: Decrypting the message failed!");
-        //eprintln!("DECRYPTED--->{}",decrypted);
-        
+        // Strip the message prefix before decryption
+        let ciphertext_b64 = &msg[MSG_PREFIX.len()..];
+
+		let local_port = socket.local_addr().unwrap().port();
+		
+        // Decrypt with tolerant rotation window
+        let decrypted = match try_decrypt_string_with_window(secret_bytes, base_port, port_range, ciphertext_b64, local_port) {
+            Some(text) => text,
+            None => {
+                eprintln!("[WARN] Failed to decrypt incoming message from {}", src);
+                return true; // keep running but skip
+            }
+        };
+
+        // Broadcast locally
         let chat_line = ChatLine::Message {
-            // timestamp is already part of msg (sender included it)
             ts: Local::now(),
             msg: decrypted.clone(),
         };
         let _ = chat_tx.send(chat_line);
-        
 
-        // Server should relay to all peers except original sender
+        // 🛰️ Server relay: re-encrypt and forward to all peers except sender
         if server_mode {
             let peers = targets.lock().await.clone();
+
             for peer in peers {
-                if peer != src {
-					// REENCRYPT FOR PEERS
-					
-					let handshake = HANDSHAKES[peer.port() as usize];
-					let encrypted = encrypt_string(&secret, &decrypted, handshake).expect("ERROR: Encrupting message failed");
-					
-					let mut buf_out = Vec::with_capacity(MSG_PREFIX.len() + encrypted.len());
-					buf_out.extend_from_slice(MSG_PREFIX);
-					buf_out.extend_from_slice(encrypted.as_bytes());
-					
-                    let _ = socket.send_to(&buf_out, peer).await;
+                if peer == src {
+                    continue;
+                }
+
+                // Re-encrypt for this peer’s port using new helper
+                let target_port = peer.port();
+                let encrypted = match encrypt_for_port(secret_bytes, target_port, &decrypted) {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        eprintln!("[ERROR] encrypting for {} failed: {}", peer, e);
+                        continue;
+                    }
+                };
+
+                // Build outbound buffer
+                let mut buf_out = Vec::with_capacity(MSG_PREFIX.len() + encrypted.len());
+                buf_out.extend_from_slice(MSG_PREFIX);
+                buf_out.extend_from_slice(encrypted.as_bytes());
+
+                // Send to peer
+                if let Err(e) = socket.send_to(&buf_out, peer).await {
+                    eprintln!("[WARN] failed to send to {}: {}", peer, e);
                 }
             }
         }
     }
     true
 }
-
 
 pub async fn try_handle_ack(
     packet: UdpPacket,
@@ -2181,6 +2289,7 @@ pub async fn try_handle_ack(
     //let mut ack_bytes = Vec::new();
     //ack_bytes.extend_from_slice(ACK_PREFIX);
     //ack_bytes.extend_from_slice(&ack.to_bytes());
+        let target_port: u16 = resolve_target_port_for_send(&src_addr);
     //if let Err(e) = socket.send_to(&ack_bytes, src_addr).await {
     //    eprintln!("[ACK DEBUG] failed to echo ACK to {}: {}", src_addr, e);
     //}
@@ -2270,6 +2379,7 @@ async fn try_handle_file_chunk(
     ack_bytes.extend_from_slice(ACK_PREFIX);
     ack_bytes.extend_from_slice(&ack.to_bytes());
 
+        let target_port: u16 = resolve_target_port_for_send(&src);
     if let Err(e) = socket.send_to(&ack_bytes, src).await {
         eprintln!(
             "[ACK][ERR] fid={} idx={} -> {}: {:?}",
@@ -2290,48 +2400,76 @@ async fn try_handle_file_chunk(
     true
 }
 
-
-
-
-
-
-
-// Redraw the input line and chat messages (above MultiProgress bars)
+// Redraw the input line (yellow) and chat messages (wrapped & scrollable)
 async fn redraw_input_and_chat(
     stdout: &mut std::io::Stdout,
     chat_lines: &[ChatLine],
     input_buffer: &str,
     search_mode: bool,
     search_buffer: &str,
+    // new:
+    scroll_offset: usize,
 ) {
-    let (cols, _rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    // Always re-check terminal size (supports live resize)
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let cols_usize = cols as usize;
 
-    // --- Draw chat lines starting from row 1 ---
-    for (i, entry) in chat_lines.iter().enumerate() {
-        let line_str = entry.to_string(); // uses Display impl
-        let truncated: String = line_str.chars().take(cols as usize).collect();
+    // Reserve row 0 for the input; messages start from row 1 to (rows-1)
+    let usable_rows_for_messages = rows.saturating_sub(1) as usize;
 
+    // 1) Wrap all chat lines to terminal width
+    //    (we use your Display impl to format the line first, then wrap)
+    let mut wrapped: Vec<String> = Vec::new();
+    for entry in chat_lines.iter() {
+        let line_str = entry.to_string();
+        // textwrap::fill returns a single String containing embedded '\n'
+        // Split to individual visual lines:
+        let block = fill(&line_str, cols_usize);
+        wrapped.extend(block.lines().map(|s| s.to_string()));
+    }
+
+    // 2) Compute visible window at the bottom, with scroll offset
+    //    visible = last N lines minus current scroll offset
+    let total_lines = wrapped.len();
+    let max_scroll = total_lines.saturating_sub(usable_rows_for_messages);
+    let clamped_offset = scroll_offset.min(max_scroll);
+
+    let end = total_lines.saturating_sub(clamped_offset);
+    let start = end.saturating_sub(usable_rows_for_messages);
+    let visible = &wrapped[start..end];
+
+    // 3) Draw: clear area, print visible lines, then yellow input on bottom row
+    // Clear message area (rows 1..rows-1)
+    crossterm::queue!(
+        stdout,
+        MoveTo(0, 1),
+        Clear(ClearType::FromCursorDown)
+    ).unwrap();
+
+    // Messages start at row 1
+    for (i, line) in visible.iter().enumerate() {
         crossterm::queue!(
             stdout,
-            crossterm::cursor::MoveTo(0, (i + 1) as u16),
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
-            crossterm::style::Print(truncated)
+            MoveTo(0, (1 + i) as u16),
+            Clear(ClearType::CurrentLine),
+            crossterm::style::Print(&line[..line.len().min(cols_usize)])
         ).unwrap();
     }
 
-    // --- Draw input line at row 0 ---
+    // 4) Draw input line at row 0, styled yellow
     let prompt = if search_mode {
         format!("(reverse-i-search)`{}': {}", search_buffer, input_buffer)
     } else {
         format!("> {}", input_buffer)
     };
-    let truncated_prompt: String = prompt.chars().take(cols as usize).collect();
 
+    // Ensure we clear the line and then print in yellow
+    let styled = prompt.with(Color::Yellow);
     crossterm::queue!(
         stdout,
-        crossterm::cursor::MoveTo(0, 0),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
-        crossterm::style::Print(truncated_prompt)
+        MoveTo(0, 0),
+        Clear(ClearType::CurrentLine),
+        PrintStyledContent(styled)
     ).unwrap();
 
     stdout.flush().unwrap();
@@ -2414,7 +2552,8 @@ async fn terminal_loop(args: TerminalArgs) {
                     &chat_snapshot,
                     &input_buffer,
                     search_mode,
-                    &search_buffer
+                    &search_buffer,
+                    visible_scroll_offset
                 ).await;
 
                 // --- Snapshot of all progress bars ---
@@ -2460,8 +2599,21 @@ async fn terminal_loop(args: TerminalArgs) {
                 if let Ok(Ok(true)) = res {
                     if let Ok(Event::Key(key_event)) = event::read() {
                         match key_event.code {
-                            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Up | KeyCode::Down => auto_scroll = false,
-                            KeyCode::Esc => auto_scroll = true,
+                            KeyCode::PageUp => {
+								auto_scroll = false;
+								desired_scroll_offset = desired_scroll_offset.saturating_add(3); // or 1
+								redraw_notify.notify_one();
+							}
+							KeyCode::PageDown => {
+								desired_scroll_offset = desired_scroll_offset.saturating_sub(3);
+								redraw_notify.notify_one();
+							}
+							KeyCode::End | KeyCode::Esc => {
+								// Jump to bottom & re-enable auto-scroll
+								desired_scroll_offset = 0;
+								auto_scroll = true;
+								redraw_notify.notify_one();
+							}
                             _ => {},
                         }
 
@@ -2504,53 +2656,47 @@ async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<tokio::n
 
 async fn lock_first_raw_fd(
     shared_socket: Arc<tokio::sync::RwLock<Arc<tokio::net::UdpSocket>>>,
-    tx_raw_udp_packet: mpsc::Sender<UdpPacket>,
+    udp_packet_tx: mpsc::Sender<UdpPacket>,
 ) {
     tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        let mut lockdown = false;
-        let mut fd: RawFd = -1;
-        let mut consecutive_eagain = 0u32;
+        let mut buf = vec![0u8; 2048];
 
         loop {
-            if !lockdown {
+            // Clone the current socket from the RwLock (handles rotations)
+            let sock = {
                 let guard = shared_socket.read().await;
-                fd = guard.as_ref().as_raw_fd();
-                lockdown = true;
-                eprintln!("[RAW] Locked UDP FD = {}", fd);
-            }
-
-            let ret = unsafe {
-                libc::recv(
-                    fd,
-                    buf.as_mut_ptr() as *mut libc::c_void,
-                    buf.len(),
-                    libc::MSG_DONTWAIT,
-                )
+                guard.clone()
             };
 
-            if ret < 0 {
-                consecutive_eagain += 1;
-                if consecutive_eagain % 1000 == 0 {
-                    tokio::task::yield_now().await;
-                }
+            // Wait for the socket to be readable
+            if let Err(e) = sock.readable().await {
+                eprintln!("[UDP][WARN] socket not readable: {:?}", e);
+                tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
             }
 
-            consecutive_eagain = 0;
-
-            if let Some(packet) = UdpPacket::from_bytes(&buf[..ret as usize]) {
-                if tx_raw_udp_packet.send(packet).await.is_err() {
-                    eprintln!("[RAW] Channel closed — stopping");
-                    break;
+            match sock.try_recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    let packet = UdpPacket::from_socket(addr, &buf[..n]);
+                    if let Err(_) = udp_packet_tx.send(packet).await {
+                        eprintln!("[UDP] Channel closed — stopping read loop");
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Socket is empty, yield to runtime
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[UDP][ERR] recv_from failed: {:?}", e);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             }
-            tokio::time::sleep(Duration::from_micros(100)).await;
         }
     });
 }
-	
-	
+
 
 #[cfg(target_os = "linux")]
 pub async fn prune_gone_targets(
@@ -2804,7 +2950,6 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let shared_socket_clone_opt = Some(shared_socket.clone());
     let shutdown_flag_opt = Some(shutdown_flag.clone());
     
-    
     // ----------Automatic Pruning of DEAD clients--------------
     tokio::spawn(async move { prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await });
     
@@ -2820,6 +2965,8 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let forward_cache_clone = forward_cache.clone();
     let secret = cli.secret.clone();
     let channel_registry_clone = channel_registry.clone();
+    let base_port_clone = cli.base_port.clone();
+    let port_range_clone = cli.port_range.clone();
 
     receiver_handle = tokio::spawn(async move {
 		spawn_receiver(
@@ -2836,6 +2983,8 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
             shutdown_clone,
             channel_registry_clone,
             udp_packet_rx,
+            base_port_clone,
+            port_range_clone,
             )
             .await;
 	});
@@ -2919,19 +3068,20 @@ async fn run_client(cli: Cli, server: String) {
     // ---------------- Populate initial targets ----------------
     {
         let ports = compute_possible_ports(&cli.secret.as_bytes(), cli.base_port, cli.port_range, 1);
-        let mut t = clients.lock().await;
         for port in ports {
 			let server_sock = format!("{}:{}", server, port).parse::<SocketAddr>().unwrap();
-            t.insert(server_sock);
             
-             // --- HELLO handshake to server ---
+            // --- HELLO handshake to server ---
 			let hello_msg = HELLO_PREFIX;
 
+        let target_port: u16 = resolve_target_port_for_send(&server_sock);
 			if let Err(e) = socket.send_to(hello_msg, server_sock).await {
 				eprintln!("[CLIENT] failed to send HELLO to server: {:?}", e);
 			} else {
 				//eprintln!("[CLIENT] sent HELLO to {:?}", server_sock);
 			}
+			
+			
 		}
 	}
 
@@ -2950,6 +3100,7 @@ async fn run_client(cli: Cli, server: String) {
         let server = server.clone();
         let secret_bytes = cli.secret.clone().into_bytes();
         let shared_rng = Arc::new(Mutex::new(StdRng::from_entropy()));
+        let socket_clone = socket.clone();
 
         tokio::spawn(async move {
             loop {
@@ -2960,27 +3111,23 @@ async fn run_client(cli: Cli, server: String) {
 				}
 
                 let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range, 1);
-                let mut t = clients.lock().await;
-
-				let new_set: HashSet<_> = ports
-					.into_iter()
-					.map(|p| format!("{}:{}", server, p).parse::<SocketAddr>().unwrap())
-					.collect();
-
-				// Compute new addresses to insert first
-				let to_add: Vec<_> = new_set.difference(&*t).copied().collect();
-
-				// Now mutate safely
-				for addr in to_add {
-					t.insert(addr);
-				}
 				
-				// Remove any disappeared peers
-				t.retain(|a| new_set.contains(a));
+				for port in ports {
+					
+					let server_sock = format!("{}:{}", server, port).parse::<SocketAddr>().unwrap();
+					
+					// --- HELLO handshake to server ---
+					let hello_msg = HELLO_PREFIX;
 
-				drop(t);
-				tokio::time::sleep(Duration::from_secs(5)).await;
-            }
+        let target_port: u16 = resolve_target_port_for_send(&server_sock);
+					if let Err(e) = socket_clone.send_to(hello_msg, server_sock).await {
+						eprintln!("[CLIENT] failed to send HELLO to server: {:?}", e);
+					} else {
+						//eprintln!("[CLIENT] sent HELLO to {:?}", server_sock);
+					}
+				}
+				tokio::time::sleep(Duration::from_secs(10)).await;
+			}
         });
     }
 
@@ -3030,6 +3177,8 @@ async fn run_client(cli: Cli, server: String) {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let forward_cache_clone_2 = forward_cache.clone();
     let progress_registry_clone_2 = progress_registry.clone();
+    let base_port_clone = cli.base_port.clone();
+    let port_range_clone = cli.port_range.clone();
 
     tokio::spawn({
         let socket = socket.clone();
@@ -3055,6 +3204,8 @@ async fn run_client(cli: Cli, server: String) {
                 shutdown_flag.clone(),
                 channel_registry.clone(),
                 udp_packet_rx,
+                base_port_clone,
+                port_range_clone,
             )
             .await;
         }
@@ -68634,3 +68785,5 @@ pub const HANDSHAKES: [&str; 65535] = [
 // codegen-units = 1
 // opt-level = 3
 // panic = "abort"
+
+
