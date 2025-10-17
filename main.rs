@@ -18,6 +18,7 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use bytes::Bytes;
 use textwrap::fill;
+use nix::errno::Errno;
 
 // === DashMap wiring (clean) ===
 
@@ -33,9 +34,7 @@ fn new_forward_cache() -> ForwardCache { std::sync::Arc::new(DashMap::new()) }
 
 // === Helper Utilities ===
 
-
-#[allow(unused)]
-fn bind_udp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+async fn bind_udp(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
     let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
     let sock = Socket::new(domain, Type::DGRAM, None)?;
     sock.set_reuse_address(true)?;
@@ -146,10 +145,10 @@ const HELLO_ACK_PREFIX: &[u8] = b"HAK";
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
 const DATA_PREFIX: &[u8] = b"DAT";
+const FAIL_PREFIX: &[u8] = b"FAI";
 //const MAX_RETRIES: usize = 1000;
 const HISTORY_LIMIT: usize = 500;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
-const HASH_PERIOD_SECS: u64 = 60;
 const HISTORY_LIMIT_TERMINAL: usize = 1000;
 static mut WINDOW_SIZE:usize = 1200;
 
@@ -171,6 +170,10 @@ const BASE_RETRY_MS: u64 = 20;
 const MAX_BACKOFF_MS: u64 = 100;
 const SEND_INTERVAL_MS: u64 = 20;
 
+// PORT rotation constants
+const HASH_PERIOD_SECS: u64 = 60;             
+const ROTATION_TICK_MS: u64 = 250;            // how often we check time
+const ROTATION_OVERLAP_SECS: u64 = 5;         // grace period overlap
 
 // -------------------- TYPES --------------------
 pub type TransferCounter = Arc<Mutex<u32>>;
@@ -182,6 +185,7 @@ pub type FileAckTracker = Arc<Mutex<HashMap<String, HashMap<SocketAddr, HashSet<
 pub type ForwardTracker = Arc<Mutex<HashMap<u32, HashMap<SocketAddr, HashSet<u32>>>>>;
 pub type PeerRegistry = DashMap<SocketAddr, PeerState>;
 pub type AckChannelRegistry = Arc<RwLock<HashMap<u32, mpsc::Sender<AckPacket>>>>;
+pub type PacketHandler = Arc<dyn Fn(Vec<u8>, SocketAddr, SocketAddr) + Send + Sync>;
 
 
 #[derive(Clone, Copy, Debug)]
@@ -755,7 +759,7 @@ impl FileTransferManager {
 						data.extend_from_slice(DATA_PREFIX);
 						data.extend_from_slice(&chunk_fwd.to_bytes());
 
-        let target_port: u16 = resolve_target_port_for_send(&peer_addr);
+						let target_port: u16 = resolve_target_port_for_send(&peer_addr);
 						if let Err(e) = socket_ref.send_to(&data, peer_addr).await {
 							eprintln!(
 								"[FANOUT][ERR] fid={} idx={} relay={} -> {} err={:?}",
@@ -946,7 +950,7 @@ impl FileChunk {
 
 // -------------------- TERMINAL ARGs --------------------
 struct TerminalArgs {
-    pub socket: Arc<UdpSocket>,
+    pub shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     pub targets: Arc<Mutex<HashSet<SocketAddr>>>,
     pub redraw_notify: Arc<Notify>,
     pub file_transfers: FileTransfers,
@@ -986,46 +990,6 @@ enum Role {
     Server,
     Client { #[arg(short, long, default_value = "127.0.0.1")] server: String},
 }
-
-// -------------------- UTILS --------------------
-/// Derive a single port for a given period using HKDF-SHA256.
-///
-/// - `secret_bytes` is the shared secret.
-/// - `base_port` and `port_range` describe the output port space (like in your original code).
-/// - `period_index` is the period (e.g. timestamp / HASH_PERIOD_SECS).
-///
-/// This expands the HKDF output to 8 bytes (u64) and reduces modulo `port_range`.
-/// Using 64 bits before reduction preserves far more entropy than folding to u16.
-pub fn derive_port_from_period(
-	secret_bytes: &[u8],
-	base_port: u16,
-	port_range: u16,
-	period_index: u64,
-	) -> u16 {
-	
-	if port_range == 0 {
-	return base_port;
-	}
-
-
-	// Use the period as the HKDF salt so each period produces independent outputs.
-	let salt = period_index.to_be_bytes();
-
-
-	// Create HKDF instance with SHA-256. `secret_bytes` is the IKM, `salt` is the salt.
-	let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
-
-
-	// Expand to 8 bytes (u64). This preserves lots of entropy before modulo reduction.
-	let mut okm = [0u8; 8];
-	hk.expand(b"port-rotation", &mut okm);
-	let value = u64::from_be_bytes(okm);
-	let offset = (value % port_range as u64) as u16;
-
-
-	base_port.wrapping_add(offset)
-}
-
 
 /// Optional: derive multiple candidate ports for a period and select deterministically.
 /// This function generates `candidates` 16-bit values from HKDF output and selects one
@@ -1069,79 +1033,65 @@ pub fn derive_port_from_period_multiple(
 
 /// Returns (port, handshake_string)
 pub fn compute_port(
-	secret_bytes: &[u8],
-	base_port: u16,
-	port_range: u16,
-	trigger: &mut SystemTime,
-	current_port: u16,
-	first_run: &mut bool,
-	) -> (u16, String) {
-		
-	let elapsed = SystemTime::now()
-	.duration_since(*trigger)
-	.unwrap_or(Duration::from_secs(u64::MAX))
-	.as_secs();
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    trigger: &mut SystemTime,
+    current_port: u16,
+    first_run: &mut bool,
+) -> (u16, String) {
+    let elapsed = SystemTime::now()
+        .duration_since(*trigger)
+        .unwrap_or(Duration::from_secs(u64::MAX))
+        .as_secs();
 
+    if elapsed >= PORT_ROTATION_DELAY || *first_run {
+        // Align everyone to the same even-numbered period window
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		let period = (now / HASH_PERIOD_SECS) & !1; // align to even period window
+        let new_port = derive_port_from_period(secret_bytes, base_port, port_range, period);
 
-	if elapsed >= PORT_ROTATION_DELAY || *first_run {
-		let now = SystemTime::now()
-		.duration_since(SystemTime::UNIX_EPOCH)
-		.unwrap()
-		.as_secs();
-		let period_index = now / HASH_PERIOD_SECS;
+        *trigger = SystemTime::now();
+        *first_run = false;
 
+        let handshake = HANDSHAKES
+            .get(new_port as usize)
+            .and_then(|b| String::from_utf8((*b).into()).ok())
+            .unwrap_or_default();
 
-		// Use the HKDF-based derivation. You can switch to the "multiple" variant if desired.
-		let new_port = derive_port_from_period(secret_bytes, base_port, port_range, period_index);
+        (new_port, handshake)
+    } else {
+        let handshake = HANDSHAKES
+            .get(current_port as usize)
+            .and_then(|b| String::from_utf8((*b).into()).ok())
+            .unwrap_or_default();
 
-
-		*trigger = SystemTime::now();
-		if *first_run {
-		*first_run = false;
-		}
-
-
-		let handshake = HANDSHAKES
-		.get(new_port as usize)
-		.and_then(|b| String::from_utf8((*b).into()).ok())
-		.unwrap_or_default();
-
-
-		(new_port, handshake)
-	} else {
-		let handshake = HANDSHAKES
-		.get(current_port as usize)
-		.and_then(|b| String::from_utf8((*b).into()).ok())
-		.unwrap_or_default();
-
-
-		(current_port, handshake)
-	}
+        (current_port, handshake)
+    }
 }
 
+/// Compute identical rotation ports for all peers by aligning period windows
+pub fn compute_synched_ports(
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    previous_periods: u64,
+) -> Vec<u16> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-/// Compute possible ports for now and a few previous periods (HKDF-based)
-pub fn compute_possible_ports(
-	secret_bytes: &[u8],
-	base_port: u16,
-	port_range: u16,
-	previous_periods: u64,
-	) -> Vec<u16> {
-	let now = SystemTime::now()
-	.duration_since(SystemTime::UNIX_EPOCH)
-	.unwrap()
-	.as_secs();
-	let current_period = now / HASH_PERIOD_SECS;
+    // Align everyone to the same even-numbered period window
+    let current_period = (now / HASH_PERIOD_SECS) & !1;
 
-
-	(0..=previous_periods)
-	.map(|offset| {
-		let period = current_period.saturating_sub(offset);
-		derive_port_from_period(secret_bytes, base_port, port_range, period)
-	})
-	.collect()
+    (0..=previous_periods)
+        .map(|offset| {
+            let period = current_period.saturating_sub(offset);
+            derive_port_from_period(secret_bytes, base_port, port_range, period)
+        })
+        .collect()
 }
-
 
 fn derive_key(password: &str) -> [u8; KEY_LEN] {
     // deterministically derive salt from password
@@ -1206,20 +1156,33 @@ fn try_decrypt_string_with_window(
     ciphertext_b64: &str,
     local_port: u16,
 ) -> Option<String> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let current_period = now / HASH_PERIOD_SECS;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let current_period = (now / HASH_PERIOD_SECS) & !1;
 
+    // collect candidate ports
     let mut candidate_ports = Vec::new();
-    // include local port (for static listening socket)
+
+    // include static listening port
     candidate_ports.push(local_port);
 
-    // add current, prev, next derived ports
-    for offset in [0i64, -1, 1] {
-        if let Some(period) = current_period.checked_add_signed(offset) {
-            candidate_ports.push(derive_port_from_period(secret_bytes, base_port, port_range, period));
-        }
+    // include current, previous, and next period-derived ports
+    for period in [
+        current_period.saturating_sub(2),
+        current_period,
+        current_period.saturating_add(2),
+    ] {
+        candidate_ports.push(derive_port_from_period(
+            secret_bytes,
+            base_port,
+            port_range,
+            period,
+        ));
     }
 
+    // try each handshake/port until one decrypts cleanly
     for port in candidate_ports {
         let hs = derive_handshake_for_port(secret_bytes, port);
         if let Ok(plaintext) = decrypt_string(&hs.password, ciphertext_b64, &hs.handshake_str) {
@@ -1298,7 +1261,7 @@ async fn handle_key(
     key_event: KeyEvent,
     input_buffer: &mut String,
     chat: &ChatHistory,
-    socket: &Arc<UdpSocket>,
+    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     redraw_notify: &Arc<Notify>,
     transfer_counter: &TransferCounter,
@@ -1309,7 +1272,6 @@ async fn handle_key(
     search_result_index: &mut Option<usize>,
     scroll_offset: &mut usize,
     visible_rows: usize,
-    socket_clone_for_send: Arc<UdpSocket>,
     targets_clone_for_send: Arc<Mutex<HashSet<SocketAddr>>>,
     ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>>,
     secret: String,
@@ -1377,13 +1339,13 @@ async fn handle_key(
 					};
 
                     // Clone state needed for the async task
-                    let socket_clone = socket_clone_for_send.clone();
+                    let shared_socket_clone = shared_socket.clone();
                     let targets_clone = targets_clone_for_send.clone();
                     let ack_map_clone = ack_map.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = send_file(
-                            socket_clone,
+                            shared_socket_clone,
                             targets_clone,
                             path,
                             file_id,
@@ -1415,10 +1377,14 @@ async fn handle_key(
 							}
 						};
 
-						// Send the encrypted message
-						if let Err(e) = send_chat_message_to_target(socket.clone(), addr, &encrypted).await {
-							eprintln!("[WARN] sending to {} failed: {}", addr, e);
-						}
+						// Send using the currently active socket
+						let mut ready_send :Vec<u8> = Vec::new();
+						ready_send.extend_from_slice(MSG_PREFIX);
+						ready_send.extend_from_slice(encrypted.as_bytes());
+						
+						if let Err(e) = send_via_shared(&shared_socket,&ready_send, addr).await {
+							eprintln!("[WARN] failed to send to {}: {}", addr, e);
+							}
 					}
 
 					// Push chat UI message
@@ -1430,6 +1396,7 @@ async fn handle_key(
 						},
 					)
 					.await;
+					
 					redraw_notify.notify_one();
 				}
             }
@@ -1681,7 +1648,7 @@ fn chunks_needed(file_size: u64, chunk_size: u64) -> Result<u64, &'static str> {
 }
 
 pub async fn send_file(
-    socket: Arc<tokio::net::UdpSocket>,
+    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     targets: Arc<tokio::sync::Mutex<HashSet<SocketAddr>>>,
     path: String,
     file_id: u32,
@@ -1849,7 +1816,6 @@ pub async fn send_file(
     // Pacer + timeout/resend in one loop (never exits until ALL peers done)
     {
         let windows = windows.clone();
-        let socket = socket.clone();
         let filename = filename.clone();
         let notify_pacer = notify.clone();
         let std_file = std_file.try_clone()?;
@@ -1898,15 +1864,22 @@ pub async fn send_file(
                                 eprintln!("[SEND][DROP] fid={} idx={} peer={} (max retries)", file_id, idx, peer);
                             } else {
                                 // opportunistic immediate resend (do not change in_flight)
-                                if let Ok(local) = socket.local_addr() {
+                                let sock = {
+											let guard = shared_socket.read().await;
+											guard.clone()
+								};
+                                if let Ok(local) = sock.local_addr() {
                                     if let Ok(encoded) = encode_chunk_on_demand(
                                         &std_file, file_id, transfer_token, total_chunks, &filename, idx, CHUNK, local
                                     ).await {
                                         let mut datagram = Vec::with_capacity(DATA_PREFIX.len() + encoded.len());
                                         datagram.extend_from_slice(DATA_PREFIX);
                                         datagram.extend_from_slice(&encoded);
-        let target_port: u16 = resolve_target_port_for_send(&peer);
-                                        if socket.send_to(&datagram, peer).await.is_ok() {
+										let sock = {
+												let guard = shared_socket.read().await;
+												guard.clone()
+										};
+                                        if sock.send_to(&datagram, peer).await.is_ok() {
                                             win.last_sent.insert(idx, Instant::now());
                                         }
                                     }
@@ -1917,8 +1890,13 @@ pub async fn send_file(
                         // 2) Fresh sends within budget
                         let budget = win.cwnd.saturating_sub(win.in_flight);
                         if budget == 0 { continue; }
+                        
+                        let sock = {
+									let guard = shared_socket.read().await;
+									guard.clone()
+						};
 
-                        let local_addr = match socket.local_addr() { Ok(a) => a, Err(_) => continue };
+                        let local_addr = match sock.local_addr() { Ok(a) => a, Err(_) => continue };
                         let mut injected = 0u32;
                         let mut idx = win.next_to_send;
 
@@ -1931,8 +1909,11 @@ pub async fn send_file(
                                         let mut datagram = Vec::with_capacity(DATA_PREFIX.len() + encoded.len());
                                         datagram.extend_from_slice(DATA_PREFIX);
                                         datagram.extend_from_slice(&encoded);
-        let target_port: u16 = resolve_target_port_for_send(&peer);
-                                        if socket.send_to(&datagram, peer).await.is_ok() {
+                                        let sock = {
+												let guard = shared_socket.read().await;
+												guard.clone()
+										};
+                                        if sock.send_to(&datagram, peer).await.is_ok() {
                                             win.in_flight += 1;
                                             win.last_sent.insert(idx, Instant::now());
                                             injected += 1;
@@ -1983,13 +1964,21 @@ pub async fn send_file(
     Ok(())
 }
 
-
-
-
+/// Sends using the currently active UDP socket from the rotation manager.
+async fn send_via_shared(
+    shared_socket: &Arc<RwLock<Arc<UdpSocket>>>,
+    buf: &[u8],
+    addr: SocketAddr,
+) -> std::io::Result<usize> {
+    let sock = { shared_socket.read().await.clone() };
+    sock.send_to(buf, addr).await
+    //eprintln!("SENT-->{:?}",String::from_utf8_lossy(buf));
+    //Ok(buf.len())
+}
 
 // -------------------- RECEIVER --------------------
 async fn spawn_receiver(
-    socket: Arc<UdpSocket>,
+    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     chat_tx: broadcast::Sender<ChatLine>,
     file_chunk_tx: mpsc::Sender<FileChunk>,
     ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>>,
@@ -2020,8 +2009,7 @@ async fn spawn_receiver(
 				// --- HELLO handshake to client ---
 				let hello_ack_msg = HELLO_ACK_PREFIX;
 
-        let target_port: u16 = resolve_target_port_for_send(&src);
-				if let Err(e) = socket.send_to(hello_ack_msg, src).await {
+				if let Err(e) = send_via_shared(&shared_socket, hello_ack_msg, src).await {
 					eprintln!("[CLIENT] failed to send HELLO ACK to client: {:?}", e);
 				}
 				
@@ -2034,7 +2022,7 @@ async fn spawn_receiver(
 						packet,
 						src,
 						&chat_tx,
-						&socket,
+						shared_socket.clone(),
 						&targets,
 						server_mode,
 						secret.clone(),
@@ -2051,7 +2039,7 @@ async fn spawn_receiver(
 						ack_map.clone(),
 						channel_registry.clone(),
 						progress_registry.clone(),
-						&socket,
+						shared_socket.clone(),
 						&targets,
 					).await;
 			} else if packet.payload.starts_with(DATA_PREFIX) {
@@ -2061,7 +2049,7 @@ async fn spawn_receiver(
 					try_handle_file_chunk(
 						packet,
 						src,
-						&socket,
+						shared_socket.clone(),
 						&file_chunk_tx,
 						server_mode,
 						&progress_registry,
@@ -2111,11 +2099,11 @@ async fn update_targets(
     let _ = targets_tx.send(src);
 }
 
-async fn try_handle_chat(
+pub async fn try_handle_chat(
     packet: UdpPacket,
     src: SocketAddr,
     chat_tx: &broadcast::Sender<ChatLine>,
-    socket: &UdpSocket,
+    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     server_mode: bool,
     secret: String,
@@ -2130,25 +2118,30 @@ async fn try_handle_chat(
         // Strip the message prefix before decryption
         let ciphertext_b64 = &msg[MSG_PREFIX.len()..];
 
-		let local_port = socket.local_addr().unwrap().port();
-		
-        // Decrypt with tolerant rotation window
+        // Get the current local port from the active socket
+        let local_port = {
+            let sock = shared_socket.read().await.clone();
+            sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()).port()
+        };
+
+        // Try decryption with tolerant window
         let decrypted = match try_decrypt_string_with_window(secret_bytes, base_port, port_range, ciphertext_b64, local_port) {
             Some(text) => text,
             None => {
+				let source_know_msg_failed = 
                 eprintln!("[WARN] Failed to decrypt incoming message from {}", src);
                 return true; // keep running but skip
             }
         };
 
-        // Broadcast locally
+        // --- Display locally ---
         let chat_line = ChatLine::Message {
             ts: Local::now(),
             msg: decrypted.clone(),
         };
         let _ = chat_tx.send(chat_line);
 
-        // 🛰️ Server relay: re-encrypt and forward to all peers except sender
+        // --- Relay if server ---
         if server_mode {
             let peers = targets.lock().await.clone();
 
@@ -2157,7 +2150,7 @@ async fn try_handle_chat(
                     continue;
                 }
 
-                // Re-encrypt for this peer’s port using new helper
+                // Encrypt for peer
                 let target_port = peer.port();
                 let encrypted = match encrypt_for_port(secret_bytes, target_port, &decrypted) {
                     Ok(ct) => ct,
@@ -2172,8 +2165,8 @@ async fn try_handle_chat(
                 buf_out.extend_from_slice(MSG_PREFIX);
                 buf_out.extend_from_slice(encrypted.as_bytes());
 
-                // Send to peer
-                if let Err(e) = socket.send_to(&buf_out, peer).await {
+                // Send using the currently active socket
+                if let Err(e) = send_via_shared(&shared_socket, &buf_out, peer).await {
                     eprintln!("[WARN] failed to send to {}: {}", peer, e);
                 }
             }
@@ -2182,17 +2175,16 @@ async fn try_handle_chat(
     true
 }
 
+
 pub async fn try_handle_ack(
     packet: UdpPacket,
-    src_addr: std::net::SocketAddr,
+    src_addr: SocketAddr,
     ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>>,
     channel_registry: AckChannelRegistry,
     registry: Arc<ProgressRegistry>,
-    socket: &Arc<UdpSocket>,
+    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
 ) -> bool {
-    
-
     // Decode ACK packet
     let ack = match AckPacket::from_bytes(&packet.payload[ACK_PREFIX.len()..]) {
         Some(a) => a,
@@ -2201,43 +2193,34 @@ pub async fn try_handle_ack(
             return false;
         }
     };
-    
-    // Forward ACK into per-transfer channel via registry
-	if let Some(tx) = {
-		let reg = channel_registry.read().await;
-		reg.get(&ack.file_id).cloned()
-	} {
-		// prefer try_send to avoid await in hot path; fallback to await on full
-		if let Err(e) = tx.try_send(ack.clone()) {
-			// channel full or closed: attempt awaited send
-			if let Err(e2) = tx.send(ack.clone()).await {
-				eprintln!("[ACK] failed to forward ack to file_id {}: {}", ack.file_id, e2);
-			}
-		}
-	} else {
-		//eprintln!("[ACK] no ack channel registered for file_id {}", ack.file_id);
-	}
 
-	// Insert if missing
-	let entry = ack_map.entry(ack.file_id).or_insert_with(|| {
-		// Snapshot peers safely
-		let peers_snapshot: Vec<SocketAddr> = {
-			let lock = targets.blocking_lock(); // synchronous lock for constructor
-			lock.iter().copied().collect()
-		};
+    // Forward ACK into per-transfer channel
+    if let Some(tx) = {
+        let reg = channel_registry.read().await;
+        reg.get(&ack.file_id).cloned()
+    } {
+        if let Err(e) = tx.try_send(ack.clone()) {
+            if let Err(e2) = tx.send(ack.clone()).await {
+                eprintln!("[ACK] failed to forward ack {}: {}", ack.file_id, e2);
+            }
+        }
+    }
 
-		Arc::new(Mutex::new(FileAck::with_token_and_peers(
-			ack.transfer_token,
-			&peers_snapshot,
-			ack.total_chunks,
-		)))
-	});
+    // Insert if missing
+    let entry = ack_map.entry(ack.file_id).or_insert_with(|| {
+        let peers_snapshot: Vec<SocketAddr> = {
+            let lock = targets.blocking_lock();
+            lock.iter().copied().collect()
+        };
 
+        Arc::new(Mutex::new(FileAck::with_token_and_peers(
+            ack.transfer_token,
+            &peers_snapshot,
+            ack.total_chunks,
+        )))
+    });
 
-	// Now lock the inner FileAck
-	let mut fa = entry.lock().await;
-	
-    // Snapshot to avoid borrow conflicts
+    let mut fa = entry.lock().await;
     let total_chunks_now = fa.total_chunks;
     let chunk_index = ack.chunk_index;
 
@@ -2251,7 +2234,7 @@ pub async fn try_handle_ack(
         fa.per_client.insert(src_addr, v);
     }
 
-    // Grow vector if needed — done in a block to end the borrow before touching fa again
+    // Grow if needed
     {
         let entry = fa.per_client.get_mut(&src_addr).unwrap();
         let need = (chunk_index as usize + 1).saturating_sub(entry.len());
@@ -2263,40 +2246,30 @@ pub async fn try_handle_ack(
         }
     }
 
-    // Now safely update total_chunks — borrow from per_client ended
+    // Update chunk counters
     fa.total_chunks = fa.total_chunks.max(chunk_index + 1);
-
-    // Now re-borrow entry for marking ACK
     let entry = fa.per_client.get_mut(&src_addr).unwrap();
     let flag = &entry[chunk_index as usize];
     let was_new = !flag.swap(true, Ordering::Relaxed);
 
     if was_new {
         fa.total_unique_acks.fetch_add(1, Ordering::Relaxed);
-        //eprintln!(
-        //    "[ACK] file_id={} chunk={} peer={} (unique={})",
-        //    ack.file_id,
-        //    chunk_index,
-        //    src_addr,
-        //    fa.total_ack_count()
-        //);
         registry.update_progress(ack.file_id, fa.total_ack_count() as u64).await;
     }
 
     fa.last_addr = src_addr;
 
-    // Echo ACK confirmation
-    //let mut ack_bytes = Vec::new();
-    //ack_bytes.extend_from_slice(ACK_PREFIX);
-    //ack_bytes.extend_from_slice(&ack.to_bytes());
-        let target_port: u16 = resolve_target_port_for_send(&src_addr);
-    //if let Err(e) = socket.send_to(&ack_bytes, src_addr).await {
-    //    eprintln!("[ACK DEBUG] failed to echo ACK to {}: {}", src_addr, e);
-    //}
+    // --- Echo ACK confirmation using rotating socket ---
+    let mut ack_bytes = Vec::new();
+    ack_bytes.extend_from_slice(ACK_PREFIX);
+    ack_bytes.extend_from_slice(&ack.to_bytes());
+
+    if let Err(e) = send_via_shared(&shared_socket, &ack_bytes, src_addr).await {
+        eprintln!("[ACK DEBUG] failed to echo ACK to {}: {}", src_addr, e);
+    }
 
     // Optional cleanup
     if (fa.total_ack_count() as u64) >= (fa.total_chunks * fa.per_client.len() as u64) {
-        //eprintln!("[ACK COMPLETE] all chunks ACKed for file_id={}", ack.file_id);
         drop(fa);
         ack_map.remove(&ack.file_id);
         registry.remove(ack.file_id).await;
@@ -2305,13 +2278,11 @@ pub async fn try_handle_ack(
     true
 }
 
-
-
 /// Handle incoming FileChunk packets, send ACK (even for duplicates), and optionally forward.
-async fn try_handle_file_chunk(
+pub async fn try_handle_file_chunk(
     packet: UdpPacket,
     src: SocketAddr,
-    socket: &Arc<UdpSocket>,
+    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     file_chunk_tx: &mpsc::Sender<FileChunk>,
     server_mode: bool,
     _registry: &Arc<ProgressRegistry>,
@@ -2319,27 +2290,22 @@ async fn try_handle_file_chunk(
     ack_map: &AckMap,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
 ) -> bool {
-	
     // --- Decode chunk ---
     let mut chunk = match FileChunk::from_bytes(&packet.payload[DATA_PREFIX.len()..]) {
         Some(c) => c,
-        None => {
-            return false;
-        }
+        None => return false,
     };
 
-    // --- Mark chunk source and deduplicate ---
-    chunk.src = Some(src); // Always record sender address, even on relay
+    chunk.src = Some(src);
 
-    // Deduplicate, but do NOT return early — we must still ACK duplicates!
+    // Deduplication
     let file_map = forward_cache.entry(chunk.file_id).or_insert_with(DashMap::new);
     let is_new = file_map.insert(chunk.chunk_index, chunk.clone()).is_none();
 
-    // --- If we're in relay/server mode, ensure ack_map entry exists ---
+    // --- If server, ensure ack_map entry exists ---
     if server_mode {
         use dashmap::mapref::entry::Entry;
         if let Entry::Vacant(v) = ack_map.entry(chunk.file_id) {
-            // Snapshot peers + total_chunks
             let peers_now: Vec<SocketAddr> = {
                 let guard = targets.lock().await;
                 guard.iter().copied().collect()
@@ -2357,7 +2323,7 @@ async fn try_handle_file_chunk(
                 for peer in peers_now {
                     let mut vec = Vec::with_capacity(total as usize);
                     for _ in 0..total {
-                        vec.push(std::sync::atomic::AtomicBool::new(false));
+                        vec.push(AtomicBool::new(false));
                     }
                     fa_locked.per_client.insert(peer, vec);
                 }
@@ -2366,12 +2332,15 @@ async fn try_handle_file_chunk(
         }
     }
 
-    // --- Always send ACK, even for duplicates ---
+    // --- Send ACK ---
     let ack = AckPacket {
         file_id: chunk.file_id,
         chunk_index: chunk.chunk_index,
         transfer_token: chunk.transfer_token,
-        src: socket.local_addr().expect("socket lost"),
+        src: {
+            let sock = { shared_socket.read().await.clone() };
+            sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+        },
         total_chunks: chunk.total_chunks,
     };
 
@@ -2379,18 +2348,14 @@ async fn try_handle_file_chunk(
     ack_bytes.extend_from_slice(ACK_PREFIX);
     ack_bytes.extend_from_slice(&ack.to_bytes());
 
-        let target_port: u16 = resolve_target_port_for_send(&src);
-    if let Err(e) = socket.send_to(&ack_bytes, src).await {
+    if let Err(e) = send_via_shared(&shared_socket, &ack_bytes, src).await {
         eprintln!(
             "[ACK][ERR] fid={} idx={} -> {}: {:?}",
             ack.file_id, ack.chunk_index, src, e
         );
-    } else {
-        // optional trace
-        // eprintln!("[ACK][SEND] fid={} idx={} -> {}", ack.file_id, ack.chunk_index, src);
     }
 
-    // --- Notify the rest of the system only for new chunks ---
+    // --- Forward to file manager only if new ---
     if is_new {
         if let Err(e) = file_chunk_tx.send(chunk).await {
             eprintln!("[FM][WARN] broadcast failed: {:?}", e);
@@ -2478,7 +2443,7 @@ async fn redraw_input_and_chat(
 // -------------------- TERMINAL LOOP --------------------
 async fn terminal_loop(args: TerminalArgs) {
     let TerminalArgs {
-        socket,
+        shared_socket,
         targets,
         redraw_notify,
         file_transfers,
@@ -2511,6 +2476,7 @@ async fn terminal_loop(args: TerminalArgs) {
     let visible_rows = rows.saturating_sub(1) as usize;
 
     loop {
+		let shared_socket_clone =  shared_socket.clone();
         tokio::select! {
             // ---- Chat messages ----
             res = async {
@@ -2621,7 +2587,7 @@ async fn terminal_loop(args: TerminalArgs) {
                             key_event,
                             &mut input_buffer,
                             &chat_lines,
-                            &socket,
+                            shared_socket_clone,
                             &targets,
                             &redraw_notify,
                             &transfer_counter,
@@ -2632,7 +2598,6 @@ async fn terminal_loop(args: TerminalArgs) {
                             &mut history_index,
                             &mut desired_scroll_offset,
                             visible_rows,
-                            socket.clone(),
                             targets.clone(),
                             ack_map.clone(),
                             secret.clone(),
@@ -2651,10 +2616,10 @@ async fn terminal_loop(args: TerminalArgs) {
 
 
 async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<tokio::net::UdpSocket> {
-	return Ok(bind_udp(format!("{}:{}", addr, port).parse::<std::net::SocketAddr>().unwrap().into())?);
+	return Ok(bind_udp(format!("{}:{}", addr, port).parse::<std::net::SocketAddr>().unwrap().into()).await?);
 }
 
-async fn lock_first_raw_fd(
+async fn grab_packets_and_forward(
     shared_socket: Arc<tokio::sync::RwLock<Arc<tokio::net::UdpSocket>>>,
     udp_packet_tx: mpsc::Sender<UdpPacket>,
 ) {
@@ -2699,143 +2664,282 @@ async fn lock_first_raw_fd(
 
 
 #[cfg(target_os = "linux")]
+/// Monitors ICMP error queue and prunes unreachable peers.
+/// Automatically restarts if the socket is replaced.
 pub async fn prune_gone_targets(
     server_mode: bool,
-    clients: Arc<tokio::sync::Mutex<HashSet<SocketAddr>>>,
-    shared_socket: Option<Arc<tokio::sync::RwLock<Arc<tokio::net::UdpSocket>>>>,
+    clients: Arc<Mutex<HashSet<SocketAddr>>>,
+    shared_socket: Option<Arc<RwLock<Arc<tokio::net::UdpSocket>>>>,
     socket_client: Option<Arc<tokio::net::UdpSocket>>,
     shutdown_flag: Option<Arc<AtomicBool>>,
 ) {
     let targets = clients.clone();
-	let mut lockdown = false;
-	
+
     tokio::spawn(async move {
-        let mut last_seen = std::collections::HashSet::new();
+        let mut last_seen = HashSet::new();
 
         loop {
-			if shutdown_flag.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false) {
-				// Short sleep before checking error queue
-				tokio::time::sleep(Duration::from_millis(25)).await;
-				lockdown = true;
-				continue
-			}
-            // Re-acquire the current active FD every cycle
-            let fd = if server_mode {
-                let shared_socket_guard = shared_socket.clone().unwrap();
-                let guard = shared_socket_guard.read().await;
-                guard.as_ref().as_raw_fd()
-            } else {
-                let guard = socket_client.clone().unwrap();
-                guard.as_ref().as_raw_fd()
+            // --- Check global shutdown flag ---
+            if shutdown_flag
+                .as_ref()
+                .map(|f| f.load(Ordering::Relaxed))
+                .unwrap_or(false)
+            {
+                //eprintln!("[ICMP] Shutdown flag detected, exiting prune loop.");
+                break;
+            }
+
+            // --- Acquire valid socket FD ---
+            let fd = loop {
+                if shutdown_flag
+                    .as_ref()
+                    .map(|f| f.load(Ordering::Relaxed))
+                    .unwrap_or(false)
+                {
+                    //eprintln!("[ICMP] Shutdown during FD wait, exiting prune loop.");
+                    return;
+                }
+
+                let fd_candidate = if server_mode {
+                    match shared_socket.as_ref() {
+                        Some(s) => {
+                            let guard = s.read().await;
+                            guard.as_ref().as_raw_fd()
+                        }
+                        None => -1,
+                    }
+                } else {
+                    socket_client.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1)
+                };
+
+                if fd_candidate >= 0 {
+                    break fd_candidate;
+                } else {
+                    //eprintln!("[ICMP][WAIT] No valid socket yet, retrying...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             };
 
+            // --- Enable IP_RECVERR for ICMP notifications ---
             unsafe {
                 let optval: libc::c_int = 1;
-                if libc::setsockopt(
+                libc::setsockopt(
                     fd,
                     libc::SOL_IP,
                     libc::IP_RECVERR,
                     &optval as *const _ as *const _,
                     std::mem::size_of::<libc::c_int>() as _,
-                ) != 0
+                );
+            }
+
+            //eprintln!("[ICMP] Watching socket fd={} for unreachable peers.", fd);
+
+            // --- Inner monitoring loop: will break on socket close ---
+            loop {
+                if shutdown_flag
+                    .as_ref()
+                    .map(|f| f.load(Ordering::Relaxed))
+                    .unwrap_or(false)
                 {
-                    eprintln!(
-                        "[ICMP][WARN] failed to enable IP_RECVERR: {}",
-                        std::io::Error::last_os_error()
-                    );
+                   // eprintln!("[ICMP] Shutdown signal, exiting inner loop.");
+                    break;
                 }
-            }
 
-            // Take snapshot of current targets
-            let target_snapshot = {
-                let mut guard = targets.lock().await;
-                guard.clone()
-            };
+                // Snapshot current targets
+                let snapshot = {
+                    let guard = targets.lock().await;
+                    guard.clone()
+                };
 
-            // Short sleep before checking error queue
-            tokio::time::sleep(Duration::from_millis(500)).await;
+                // Small delay before polling
+                tokio::time::sleep(Duration::from_millis(500)).await;
 
-            let mut cmsg_buf = [0u8; 512];
-            let mut iov_buf = [0u8; 128];
-            let mut iov = libc::iovec {
-                iov_base: iov_buf.as_mut_ptr() as *mut _,
-                iov_len: iov_buf.len(),
-            };
+                let mut cmsg_buf = [0u8; 512];
+                let mut iov_buf = [0u8; 128];
+                let mut iov = libc::iovec {
+                    iov_base: iov_buf.as_mut_ptr() as *mut _,
+                    iov_len: iov_buf.len(),
+                };
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
+                msg.msg_controllen = cmsg_buf.len();
 
-            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
-            msg.msg_controllen = cmsg_buf.len();
+                let ret =
+                    unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
 
-            let ret =
-                unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
-
-            if ret < 0 {
-                let errno = nix::errno::Errno::last();
-                if errno != nix::errno::Errno::EAGAIN && errno != nix::errno::Errno::EWOULDBLOCK {
-                    eprintln!("[ICMP][ERR] recvmsg failed: {:?}", errno);
+                if ret < 0 {
+                    match Errno::last() {
+                        Errno::EAGAIN | Errno::EWOULDBLOCK => {
+                            // queue empty
+                        }
+                        Errno::EBADF => {
+                            //eprintln!("[ICMP][INFO] Socket fd={} closed — restarting watcher.", fd);
+                            // Socket replaced or dropped → break to outer loop
+                            break;
+                        }
+                        e => {
+                            eprintln!("[ICMP][ERR] recvmsg failed: {:?}", e);
+                        }
+                    }
+                    continue;
                 }
-                continue;
-            }
 
-            unsafe {
-                let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-                while !cmsg.is_null() {
-                    if (*cmsg).cmsg_level == libc::SOL_IP
-                        && (*cmsg).cmsg_type == libc::IP_RECVERR
-                    {
-                        let err_ptr =
-                            libc::CMSG_DATA(cmsg) as *const libc::sock_extended_err;
-                        if !err_ptr.is_null() {
-                            let err = *err_ptr;
-                            if err.ee_origin == libc::SO_EE_ORIGIN_ICMP as u8
-                                && err.ee_type == 3
-                                && (err.ee_code == 1 || err.ee_code == 3)
-                            {
-                                let offender_ptr = (&err as *const _ as *const u8)
-                                    .add(std::mem::size_of::<libc::sock_extended_err>())
-                                    as *const libc::sockaddr_in;
-                                if !offender_ptr.is_null() {
-                                    let offender = *offender_ptr;
-                                    let ip = std::net::Ipv4Addr::from(u32::from_be(
-                                        offender.sin_addr.s_addr,
-                                    ));
-                                    let port = u16::from_be(offender.sin_port);
-                                    let sock = std::net::SocketAddr::new(
-                                        std::net::IpAddr::V4(ip),
-                                        port,
-                                    );
-                                    if !last_seen.contains(&sock)
-                                        && target_snapshot.contains(&sock)
-                                    {
-                                        eprintln!(
-                                            "[ICMP][DROP] unreachable {}",
-                                            sock
-                                        );
-                                        last_seen.insert(sock);
-                                        let targets_clone = targets.clone();
-                                        tokio::spawn(async move {
-                                            let mut guard = targets_clone.lock().await;
-                                            guard.remove(&sock);
-                                        });
+                // --- Parse ICMP unreachable events ---
+                unsafe {
+                    let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+                    while !cmsg.is_null() {
+                        if (*cmsg).cmsg_level == libc::SOL_IP
+                            && (*cmsg).cmsg_type == libc::IP_RECVERR
+                        {
+                            let err_ptr = libc::CMSG_DATA(cmsg) as *const libc::sock_extended_err;
+                            if !err_ptr.is_null() {
+                                let err = *err_ptr;
+                                if err.ee_origin == libc::SO_EE_ORIGIN_ICMP as u8
+                                    && err.ee_type == 3
+                                    && (err.ee_code == 1 || err.ee_code == 3)
+                                {
+                                    let offender_ptr = (&err as *const _ as *const u8)
+                                        .add(std::mem::size_of::<libc::sock_extended_err>())
+                                        as *const libc::sockaddr_in;
+                                    if !offender_ptr.is_null() {
+                                        let offender = *offender_ptr;
+                                        let ip = std::net::Ipv4Addr::from(u32::from_be(
+                                            offender.sin_addr.s_addr,
+                                        ));
+                                        let port = u16::from_be(offender.sin_port);
+                                        let sock = SocketAddr::new(std::net::IpAddr::V4(ip), port);
+                                        if snapshot.contains(&sock)
+                                            && !last_seen.contains(&sock)
+                                        {
+                                            //eprintln!("[ICMP][DROP] unreachable {}", sock);
+                                            last_seen.insert(sock);
+                                            let targets_clone = targets.clone();
+                                            tokio::spawn(async move {
+                                                let mut guard = targets_clone.lock().await;
+                                                guard.remove(&sock);
+                                            });
+                                        }
                                     }
                                 }
                             }
                         }
+                        cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                     }
-                    cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
                 }
-            }
-        }
+            } // end inner loop → restarts automatically
+
+            //eprintln!("[ICMP] Restarting watcher — waiting for socket refresh.");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        } // end outer restart loop
     });
 }
 
+pub fn derive_port_from_period(
+    secret_bytes: &[u8],
+    base_port: u16,
+    port_range: u16,
+    period_index: u64,
+) -> u16 {
+    if port_range == 0 { return base_port; }
+
+    let salt = period_index.to_be_bytes();
+    let hk = Hkdf::<Sha256>::new(Some(&salt), secret_bytes);
+    let mut okm = [0u8; 8];
+    hk.expand(b"port-rotation", &mut okm).expect("hkdf expand");
+    let value = u64::from_be_bytes(okm);
+    let offset = (value % port_range as u64) as u16;
+    let raw = (base_port as u32 + offset as u32) % 65535;
+    std::cmp::max(raw as u16, 1025)
+}
+
+fn spawn_overlap_receiver(
+    old_sock: Arc<tokio::net::UdpSocket>,
+    until: Instant,
+    packet_handler: PacketHandler,
+) {
+    tokio::spawn(async move {
+        let local = old_sock.local_addr().expect("local addr");
+        let mut buf = vec![0u8; 64 * 1024];
+
+        loop {
+            if Instant::now() >= until { break; }
+
+            match tokio::time::timeout(Duration::from_millis(200), old_sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, src))) => {
+                    let data = buf[..n].to_vec();     // ✅ only n bytes
+                    (packet_handler)(data, src, local); // ✅ pass real local
+                }
+                Ok(Err(e)) => { eprintln!("[overlap-recv] recv error: {}", e); break; }
+                Err(_) => {}
+            }
+        }
+        //eprintln!("[overlap-recv] finished");
+    });
+}
+
+pub fn start_rotation_manager(
+    shared_socket: Arc<RwLock<Arc<tokio::net::UdpSocket>>>,
+    bind_ip: IpAddr,
+    secret_bytes: Arc<Vec<u8>>,
+    base_port: u16,
+    port_range: u16,
+    packet_handler: Arc<dyn Fn(Vec<u8>, SocketAddr, SocketAddr) + Send + Sync>,
+    shutdown_flag: Option<Arc<AtomicBool>>,
+) {
+    tokio::spawn(async move {
+        let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let mut period = (now / HASH_PERIOD_SECS) & !1; // align to even period window
+        let mut port = derive_port_from_period(&secret_bytes, base_port, port_range, period);
+        let mut addr = SocketAddr::new(bind_ip, port);
+        let mut sock = Arc::new(bind_udp(addr).await.expect("bind current"));
+        {
+            let mut w = shared_socket.write().await;
+            *w = sock.clone();
+        }
+        eprintln!("[rotate] bound {}", port);
+
+        loop {
+            if let Some(sh) = &shutdown_flag {
+                if sh.load(Ordering::Relaxed) { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(ROTATION_TICK_MS)).await;
+            now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let new_period =(now / HASH_PERIOD_SECS) & !1; // align to even period window
+            if new_period == period { continue; }
+            let new_port = derive_port_from_period(&secret_bytes, base_port, port_range, new_period);
+            if new_port == port { period = new_period; continue; }
+
+            let new_addr = SocketAddr::new(bind_ip, new_port);
+            let new_sock = match bind_udp(new_addr).await {
+                Ok(s) => Arc::new(s),
+                Err(e) => {
+                    eprintln!("[rotate][ERR] bind new {} failed: {}", new_port, e);
+                    continue;
+                }
+            };
+
+            {
+                let mut w = shared_socket.write().await;
+                *w = new_sock.clone();
+            }
+            //eprintln!("[rotate] new port {} active", new_port);
+            let until = Instant::now() + Duration::from_secs(ROTATION_OVERLAP_SECS);
+            spawn_overlap_receiver(sock.clone(), until, packet_handler.clone());
+
+            sock = new_sock;
+            port = new_port;
+            period = new_period;
+        }
+        eprintln!("[rotate] stopped.");
+    });
+}
 
 // -------------------- SERVER & CLIENT RUN --------------------
 async fn run_server(cli: Cli) -> anyhow::Result<()> {
     // ---------------- Shared state ----------------
-	let (chat_tx, _) = broadcast::channel::<ChatLine>(256);
+    let (chat_tx, _) = broadcast::channel::<ChatLine>(256);
     let file_transfers: FileTransfers = Arc::new(Mutex::new(HashMap::new()));
     let transfer_counter: TransferCounter = Arc::new(Mutex::new(0));
     let redraw_notify = Arc::new(Notify::new());
@@ -2843,61 +2947,74 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let ack_tracker: FileAckTracker = Arc::new(Mutex::new(HashMap::new()));
     let forward_cache: ForwardCache = new_forward_cache();
     let ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>> = Arc::new(DashMap::new());
-	let channel_registry: AckChannelRegistry = Arc::new(RwLock::new(HashMap::new()));
-	
-    // Create a shared MultiProgress
-	
-	let (cols, _rows) = terminal::size().expect("ERROR: teminal size is weird"); 
+    let channel_registry: AckChannelRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-	// Create a Term for stderr (or stdout). We'll tell MultiProgress not to use the last row.
+    // MultiProgress
+    let (cols, _rows) = terminal::size().expect("ERROR: terminal size is weird");
     let term = Term::stderr();
-
-    // Create a custom draw target that uses this term
     let draw_target = ProgressDrawTarget::term(term, (cols as u16).try_into().unwrap());
-
-    // MultiProgress with custom draw target
     let multi_arc = Arc::new(MultiProgress::with_draw_target(draw_target));
+    let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));
+    set_global_registries(progress_registry.clone());
 
-	// Create the registry (internally creates an empty FileProgressMap)
- 	let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));  // [PROGRESS DISABLED]
-
-	set_global_registries(progress_registry.clone());
-
+    // ---------------- Channels ----------------
     let (file_chunk_tx, file_chunk_rx) = mpsc::channel::<FileChunk>(8192);
     let (udp_packet_tx, udp_packet_rx) = mpsc::channel::<UdpPacket>(8192);
-    
     let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
 
-    let secret_bytes = cli.secret.clone().into_bytes();
-    let mut trigger = SystemTime::now();
-    let mut first_run = true;
-
-    let (mut current_port, _handshake) = compute_port(
-        &secret_bytes,
-        cli.base_port,
-        cli.port_range,
-        &mut trigger,
-        cli.base_port,
-        &mut first_run,
-    );
-
     // ---------------- Initial socket ----------------
-    let mut arc_socket = Arc::new(
+    let secret_bytes = cli.secret.clone().into_bytes();
+    let base_port = cli.base_port;
+    let port_range = cli.port_range;
+
+	let ports = compute_synched_ports(&secret_bytes, base_port, port_range, 0);
+	let current_port = ports[0];
+    let arc_socket = Arc::new(
         make_reusable_socket("0.0.0.0", current_port)
             .await
             .expect("Cannot bind initial port"),
     );
-    
-    let mut shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shared_socket = Arc::new(tokio::sync::RwLock::new(arc_socket.clone()));
-    let shared_socket_for_locking = shared_socket.clone();
-    
-    // ---------------- socket lock ----------------
-    tokio::spawn(async move { lock_first_raw_fd(shared_socket_for_locking, udp_packet_tx).await });
-    
-    // ---------------- Terminal task ----------------
+
+    // ---------------- Dual-bind rotation manager ----------------
+    use std::net::IpAddr;
+    use std::str::FromStr;
+
+    let bind_ip = IpAddr::from_str("0.0.0.0").unwrap();
+    let secret_bytes_arc = Arc::new(secret_bytes.clone());
+
+    // forward each overlap packet into your UDP receiver queue
+    let udp_tx_clone = udp_packet_tx.clone();
+    let packet_handler: PacketHandler = Arc::new(move |data: Vec<u8>, src: SocketAddr, local: SocketAddr| {
+    let _ = udp_tx_clone.try_send(UdpPacket {
+			src,
+			dst: local,          // ✅ correct: our local socket/port that received the datagram
+			payload: data,
+		});
+	});
+
+
+    start_rotation_manager(
+        shared_socket.clone(),
+        bind_ip,
+        secret_bytes_arc,
+        base_port,
+        port_range,
+        packet_handler.clone(),
+        Some(shutdown_flag.clone()),
+    );
+
+	let shared_socket_clone = shared_socket.clone();
+    // ---------------- Background tasks ----------------
+    tokio::spawn(async move {
+        grab_packets_and_forward(shared_socket_clone, udp_packet_tx).await;
+    });
+
+    // Terminal
     let terminal_args = TerminalArgs {
-        socket: arc_socket.clone(),
+        shared_socket: shared_socket.clone(),
         targets: clients.clone(),
         redraw_notify: redraw_notify.clone(),
         file_transfers: file_transfers.clone(),
@@ -2911,25 +3028,13 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     };
     tokio::spawn(async move { terminal_loop(terminal_args).await });
 
-	// Initialize FileTransferManager
-	let file_transfer_manager = Arc::new(FileTransferManager::new(
-		shared_socket.clone(),
-		forward_cache.clone(),
-		ack_map.clone(),
-		clients.clone(),
-		progress_registry.clone(),
-	));
-	file_transfer_manager.start();
-	
-
-    // ---------------- File manager task ----------------
+    // File manager task
     let chat_tx_clone = chat_tx.clone();
-    let file_chunk_rx_clone = file_chunk_rx;
-    let progress_registry_clone = progress_registry.clone();
     let forward_cache_clone = forward_cache.clone();
+    let progress_registry_clone = progress_registry.clone();
     tokio::spawn(async move {
         file_manager_task(
-            file_chunk_rx_clone,
+            file_chunk_rx,
             chat_tx_clone,
             file_transfers.clone(),
             transfer_counter.clone(),
@@ -2940,200 +3045,129 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         )
         .await;
     });
-    
-   
-    
-    // ---------------- Receiver state ----------------
-    let mut receiver_handle: tokio::task::JoinHandle<()> = tokio::spawn(async {}); // placeholder
-    
+
+    // Auto-prune dead clients
     let clients_clone = clients.clone();
     let shared_socket_clone_opt = Some(shared_socket.clone());
     let shutdown_flag_opt = Some(shutdown_flag.clone());
-    
-    // ----------Automatic Pruning of DEAD clients--------------
-    tokio::spawn(async move { prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await });
-    
-    // spawn new receiver
-    let socket_clone = arc_socket.clone();
-    let shutdown_clone = shutdown_flag.clone();
-    let chat_tx_clone = chat_tx.clone();
-    let file_chunk_tx_clone = file_chunk_tx.clone();
-    let ack_map_clone = ack_map.clone();
-    let progress_registry_clone = progress_registry.clone();
-    let clients_clone = clients.clone();
-    let targets_tx_clone = targets_tx.clone();
-    let forward_cache_clone = forward_cache.clone();
-    let secret = cli.secret.clone();
-    let channel_registry_clone = channel_registry.clone();
-    let base_port_clone = cli.base_port.clone();
-    let port_range_clone = cli.port_range.clone();
+    tokio::spawn(async move {
+        prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await;
+    });
 
-    receiver_handle = tokio::spawn(async move {
-		spawn_receiver(
-			socket_clone,
-            chat_tx_clone,
-            file_chunk_tx_clone,
-            ack_map_clone,
-            progress_registry_clone,
-            clients_clone,
-            targets_tx_clone,
-            true,
-            forward_cache_clone,
-            secret,
-            shutdown_clone,
-            channel_registry_clone,
-            udp_packet_rx,
-            base_port_clone,
-            port_range_clone,
+    // Receiver
+    tokio::spawn({
+        let chat_tx = chat_tx.clone();
+        let file_chunk_tx = file_chunk_tx.clone();
+        let ack_map = ack_map.clone();
+        let clients = clients.clone();
+        let targets_tx = targets_tx.clone();
+        let forward_cache_clone = forward_cache.clone();
+        let secret = cli.secret.clone();
+        let channel_registry_clone = channel_registry.clone();
+
+        async move {
+            spawn_receiver(
+                shared_socket.clone(),
+                chat_tx.clone(),
+                file_chunk_tx.clone(),
+                ack_map.clone(),
+                progress_registry.clone(),
+                clients.clone(),
+                targets_tx.clone(),
+                true, //server
+                forward_cache_clone,
+                secret.clone(),
+                shutdown_flag.clone(),
+                channel_registry_clone.clone(),
+                udp_packet_rx,
+                base_port,
+                port_range,
             )
             .await;
-	});
-
-
-    // ---------------- Main loop ----------------
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // --- Port rotation ---
-        let (new_port, _handshake) = compute_port(
-            &secret_bytes,
-            cli.base_port,
-            cli.port_range,
-            &mut trigger,
-            current_port,
-            &mut first_run,
-        );
-
-        if new_port != current_port && new_port != cli.base_port {
-            // signal old receiver to shutdown
-            shutdown_flag.store(true, Ordering::Relaxed);
-            
-            // drop old socket
-            drop(arc_socket);
-
-            // bind new socket
-            arc_socket = Arc::new(
-                make_reusable_socket("0.0.0.0", new_port)
-                    .await
-                    .expect("Cannot bind new port"),
-            );
-            current_port = new_port;
-            
-            {
-				let mut w = shared_socket.write().await;
-				*w = arc_socket.clone();
-			}
-
-            // reset shutdown flag for new receiver
-            shutdown_flag.store(false, Ordering::Relaxed);
-		}
-    }
+        }
+    });
+	// keep server alive
+    tokio::signal::ctrl_c().await.expect("shutdown signal failed");
+    
+    Ok(())
 }
 
 
 async fn run_client(cli: Cli, server: String) {
     let (chat_tx, _) = broadcast::channel::<ChatLine>(256);
-
-    // ---------------- Shared state ----------------
     let file_transfers: FileTransfers = Arc::new(Mutex::new(HashMap::new()));
     let transfer_counter: TransferCounter = Arc::new(Mutex::new(0));
     let redraw_notify = Arc::new(Notify::new());
-
-    // --- Updated: Arc<FileAck> for thread-safe atomic usage ---
     let ack_tracker: FileAckTracker = Arc::new(Mutex::new(HashMap::new()));
     let ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>> = Arc::new(DashMap::new());
-
-    let socket = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .expect("ERROR: Couldn't bind socket"),
-    );
-    
-    //eprintln!("[CLIENT] Bound on {:?}", socket.local_addr().ok());
-    let mut shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shared_socket = Arc::new(tokio::sync::RwLock::new(socket.clone()));
-    
     let clients: Arc<Mutex<HashSet<SocketAddr>>> = Arc::new(Mutex::new(HashSet::new()));
     let forward_cache: ForwardCache = new_forward_cache();
     let channel_registry: AckChannelRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-    // ---------------- MultiProgress / terminal ----------------
-    let (cols, _rows) = terminal::size().expect("ERROR: terminal size is weird"); 
+    // Terminal setup
+    let (cols, _rows) = terminal::size().expect("ERROR: terminal size is weird");
     let term = Term::stderr();
     let draw_target = ProgressDrawTarget::term(term, (cols as u16).try_into().unwrap());
     let multi_arc = Arc::new(MultiProgress::with_draw_target(draw_target));
-    let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));  // [PROGRESS DISABLED]
+    let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));
     set_global_registries(progress_registry.clone());
 
-    // ---------------- Populate initial targets ----------------
-    {
-        let ports = compute_possible_ports(&cli.secret.as_bytes(), cli.base_port, cli.port_range, 1);
-        for port in ports {
-			let server_sock = format!("{}:{}", server, port).parse::<SocketAddr>().unwrap();
-            
-            // --- HELLO handshake to server ---
-			let hello_msg = HELLO_PREFIX;
+    // UDP + shared socket
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("bind failed"));
+    let shared_socket = Arc::new(tokio::sync::RwLock::new(socket.clone()));
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-        let target_port: u16 = resolve_target_port_for_send(&server_sock);
-			if let Err(e) = socket.send_to(hello_msg, server_sock).await {
-				eprintln!("[CLIENT] failed to send HELLO to server: {:?}", e);
-			} else {
-				//eprintln!("[CLIENT] sent HELLO to {:?}", server_sock);
-			}
-			
-			
-		}
-	}
+    // ---------------- Dual-bind rotation manager ----------------
+    use std::net::IpAddr;
+    use std::str::FromStr;
 
-    // ---------------- Channels ----------------
-    let (file_chunk_tx, file_chunk_rx) = mpsc::channel::<FileChunk>(8192);
+    let bind_ip = IpAddr::from_str("0.0.0.0").unwrap();
+    let secret_bytes_arc = Arc::new(cli.secret.clone().into_bytes());
+
     let (udp_packet_tx, udp_packet_rx) = mpsc::channel::<UdpPacket>(8192);
-    
-    // ---------------- socket lock ----------------
-    tokio::spawn(async move { lock_first_raw_fd(shared_socket, udp_packet_tx).await });
-    
-    let (targets_tx, _) = broadcast::channel::<SocketAddr>(256);
 
-    // ---------------- Periodically refresh targets ----------------
-    {
-        let clients = clients.clone();
-        let server = server.clone();
-        let secret_bytes = cli.secret.clone().into_bytes();
-        let shared_rng = Arc::new(Mutex::new(StdRng::from_entropy()));
-        let socket_clone = socket.clone();
+    // ---------------- Periodic HELLO Advertiser ----------------
+	let shared_socket_hello = shared_socket.clone();
+	let secret_clone = cli.secret.clone();
+	let base_port = cli.base_port;
+	let port_range = cli.port_range;
 
-        tokio::spawn(async move {
-            loop {
-				unsafe { 
-					let mut rng = shared_rng.lock().await;
-					let small_entropy = rng.gen_range(WINDOW_SIZE..WINDOW_SIZE + 200);
-					WINDOW_SIZE = min(small_entropy, 1400)
+	// Extract server address from Cli::Role
+	let server_host = match &cli.role {
+		Role::Client { server } => server.clone(),
+		_ => {
+			eprintln!("[HELLO] invalid role for client mode");
+			return;
+		}
+	};
+
+	tokio::spawn(async move {
+		let secret_bytes = secret_clone.as_bytes();
+
+		loop {
+			// Compute all valid rotation ports for the server
+			let ports = compute_synched_ports(secret_bytes, base_port, port_range, 1);
+
+			for port in ports {
+				let server_sock = format!("{}:{}", server_host, port)
+					.parse::<SocketAddr>()
+					.expect("invalid server address");
+
+				if let Err(e) = send_via_shared(&shared_socket_hello, HELLO_PREFIX, server_sock).await {
+					eprintln!("[HELLO] failed to send to {}: {}", server_sock, e);
+				} else {
+					//eprintln!("[HELLO] sent to {}", server_sock);
 				}
-
-                let ports = compute_possible_ports(&secret_bytes, cli.base_port, cli.port_range, 1);
-				
-				for port in ports {
-					
-					let server_sock = format!("{}:{}", server, port).parse::<SocketAddr>().unwrap();
-					
-					// --- HELLO handshake to server ---
-					let hello_msg = HELLO_PREFIX;
-
-        let target_port: u16 = resolve_target_port_for_send(&server_sock);
-					if let Err(e) = socket_clone.send_to(hello_msg, server_sock).await {
-						eprintln!("[CLIENT] failed to send HELLO to server: {:?}", e);
-					} else {
-						//eprintln!("[CLIENT] sent HELLO to {:?}", server_sock);
-					}
-				}
-				tokio::time::sleep(Duration::from_secs(10)).await;
 			}
-        });
-    }
 
-    // ---------------- Terminal args ----------------
+			// Wait before next advertise cycle
+			tokio::time::sleep(Duration::from_secs(5)).await;
+		}
+	});
+
+    // ---------------- Terminal ----------------
     let terminal_args = TerminalArgs {
-        socket: socket.clone(),
+        shared_socket: shared_socket.clone(),
         targets: clients.clone(),
         redraw_notify: redraw_notify.clone(),
         file_transfers: file_transfers.clone(),
@@ -3146,76 +3180,51 @@ async fn run_client(cli: Cli, server: String) {
         chat_tx: chat_tx.clone(),
     };
     tokio::spawn(async move { terminal_loop(terminal_args).await });
-
-    // ---------------- File manager ----------------
-    let chat_tx_clone = chat_tx.clone();
-    let file_chunk_rx_clone = file_chunk_rx;
-    let forward_cache_clone = forward_cache.clone();
-    let progress_registry_clone = progress_registry.clone();
+    
+    let shared_socket_clone = shared_socket.clone();
     
     tokio::spawn(async move {
-        file_manager_task(
-            file_chunk_rx_clone,
-            chat_tx_clone,
-            file_transfers.clone(),
-            transfer_counter.clone(),
-            redraw_notify.clone(),
-            ack_tracker.clone(),
-            forward_cache_clone,
-            progress_registry_clone,
-        )
-        .await;
+        grab_packets_and_forward(shared_socket_clone, udp_packet_tx).await;
     });
-    
-    let clients_clone = clients.clone();
-    let socket_clone_opt = Some(socket.clone());
-    
-    // ----------Automatic Pruning of DEAD clients--------------
-    //tokio::spawn(async move { prune_gone_targets(false, clients_clone, None, socket_clone_opt, None).await });
-    
-    // ---------------- Spawn receiver ----------------
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let forward_cache_clone_2 = forward_cache.clone();
-    let progress_registry_clone_2 = progress_registry.clone();
-    let base_port_clone = cli.base_port.clone();
-    let port_range_clone = cli.port_range.clone();
 
+    // ---------------- Receiver ----------------
+    let (file_chunk_tx, file_chunk_rx) = mpsc::channel::<FileChunk>(8192);
     tokio::spawn({
-        let socket = socket.clone();
         let chat_tx = chat_tx.clone();
-        let file_chunk_tx = file_chunk_tx.clone();
-        let ack_map = ack_map.clone(); // <-- Arc<Mutex<HashMap<u32, Arc<FileAck>>>>
+        let ack_map = ack_map.clone();
         let clients = clients.clone();
-        let targets_tx = targets_tx.clone();
-        let secret = cli.secret.clone();        
+        let targets_tx = broadcast::channel::<SocketAddr>(256).0;
+        let forward_cache_clone = forward_cache.clone();
+        let secret = cli.secret.clone();
+        let channel_registry_clone = channel_registry.clone();
+        let progress_registry_clone = progress_registry.clone();
 
         async move {
             spawn_receiver(
-                socket.clone(),
+                shared_socket.clone(),
                 chat_tx.clone(),
                 file_chunk_tx.clone(),
                 ack_map.clone(),
-                progress_registry_clone_2,
+                progress_registry_clone,
                 clients.clone(),
                 targets_tx.clone(),
-                false,
-                forward_cache_clone_2,
+                false, //not server
+                forward_cache_clone,
                 secret.clone(),
                 shutdown_flag.clone(),
-                channel_registry.clone(),
+                channel_registry_clone.clone(),
                 udp_packet_rx,
-                base_port_clone,
-                port_range_clone,
+                cli.base_port,
+                cli.port_range,
             )
             .await;
         }
     });
-    
-    // ---------------- Keep client alive ----------------
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for shutdown signal");
+
+    // keep client alive
+    tokio::signal::ctrl_c().await.expect("shutdown signal failed");
 }
+
 
 
 
