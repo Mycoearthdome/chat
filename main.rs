@@ -1159,6 +1159,7 @@ fn encrypt_for_port(
 /// Try decrypting a base64 string by checking current, previous, and next
 /// rotation periods, each with its derived port handshake.
 
+
 fn try_decrypt_string_with_window(
     secret_bytes: &[u8],
     base_port: u16,
@@ -1166,54 +1167,75 @@ fn try_decrypt_string_with_window(
     ciphertext_b64: &str,
     local_port: u16,
 ) -> Option<String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
 
+    // --- Step 1: compute current adjusted period ---
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()? 
         .as_secs() as i64;
 
-    // apply global drift offset
-    let drift = GLOBAL_DRIFT.load(Ordering::Relaxed);
+    // apply global drift offset safely
+    let drift = std::panic::catch_unwind(|| GLOBAL_DRIFT.load(Ordering::Relaxed))
+        .ok()
+        .unwrap_or(0);
     let adjusted_now = (now + drift).max(0) as u64;
-
     let current_period = (adjusted_now / HASH_PERIOD_SECS) & !1;
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let current_period = (now / HASH_PERIOD_SECS) & !1;
-
-    // collect candidate ports
+    // --- Step 2: prepare candidate ports ---
     let mut candidate_ports = Vec::new();
-
-    // include static listening port
     candidate_ports.push(local_port);
 
-    // include current, previous, and next period-derived ports
-    for period in [
-        current_period.saturating_sub(2), //--> 2 [DEFAULT]-->Seems to work good!
-        current_period,
-        current_period.saturating_add(2),
-    ] {
-        candidate_ports.push(derive_port_from_period(
-            secret_bytes,
-            base_port,
-            port_range,
-            period,
-        ));
-    }
+    // --- Step 3: adaptive search ---
+    let mut success: Option<String> = None;
+    let mut window = 2; // initial ±2
+    for attempt in 0..3 {
+        let mut ports_to_try = Vec::new();
+        for delta in (-window..=window).step_by(2) {
+            let period = (current_period as i64 + delta).max(0) as u64;
+            let port = derive_port_from_period(secret_bytes, base_port, port_range, period);
+            ports_to_try.push(port);
+        }
 
-    // try each handshake/port until one decrypts cleanly
-    for port in candidate_ports {
-        let hs = derive_handshake_for_port(secret_bytes, port);
-        if let Ok(plaintext) = decrypt_string(&hs.password, ciphertext_b64, &hs.handshake_str) {
-            return Some(plaintext);
+        // include static local port once
+        ports_to_try.push(local_port);
+
+        for port in ports_to_try.iter().copied() {
+            let hs = derive_handshake_for_port(secret_bytes, port);
+            match decrypt_string(&hs.password, ciphertext_b64, &hs.handshake_str) {
+                Ok(plaintext) => {
+                    eprintln!(
+                        "[adaptive-decrypt] success: period={} drift={}s ports_tried={:?}",
+                        current_period, drift, ports_to_try
+                    );
+                    success = Some(plaintext);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if success.is_some() {
+            break;
+        } else {
+            // Expand search window if first/second attempts fail
+            window *= 2;
+            eprintln!(
+                "[adaptive-decrypt] expanding window to ±{} (attempt {} drift={}s)",
+                window, attempt + 1, drift
+            );
         }
     }
-    None
+
+    if success.is_none() {
+        eprintln!(
+            "[adaptive-decrypt] failed all attempts for period={} drift={}s local_port={} range={}",
+            current_period, drift, local_port, port_range
+        );
+    }
+
+    success
 }
+
 
 fn decrypt_string(password: &str, ciphertext_b64: &str, handshake: &str) -> Result<String, Box<dyn std::error::Error>> {
     let key_bytes = derive_key(password);
