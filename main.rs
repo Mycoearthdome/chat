@@ -1171,8 +1171,8 @@ fn try_decrypt_string_with_window(
     // include current, previous, and next period-derived ports
     for period in [
         current_period.saturating_sub(2),
-        current_period,
-        current_period.saturating_add(2),
+        //current_period,
+        //current_period.saturating_add(2),
     ] {
         candidate_ports.push(derive_port_from_period(
             secret_bytes,
