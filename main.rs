@@ -145,7 +145,6 @@ const HELLO_ACK_PREFIX: &[u8] = b"HAK";
 const MSG_PREFIX: &[u8] = b"MSG";
 const ACK_PREFIX: &[u8] = b"ACK";
 const DATA_PREFIX: &[u8] = b"DAT";
-const FAIL_PREFIX: &[u8] = b"FAI";
 //const MAX_RETRIES: usize = 1000;
 const HISTORY_LIMIT: usize = 500;
 const PORT_ROTATION_DELAY: u64 = 60; // secs
@@ -1170,9 +1169,9 @@ fn try_decrypt_string_with_window(
 
     // include current, previous, and next period-derived ports
     for period in [
-        current_period.saturating_sub(2),
-        //current_period,
-        //current_period.saturating_add(2),
+        current_period.saturating_sub(2), //--> 2 [DEFAULT]-->Seems to work good!
+        current_period,
+        current_period.saturating_add(2),
     ] {
         candidate_ports.push(derive_port_from_period(
             secret_bytes,
@@ -2013,6 +2012,8 @@ async fn spawn_receiver(
 					eprintln!("[CLIENT] failed to send HELLO ACK to client: {:?}", e);
 				}
 				
+				//eprintln!("TARGETS={:?}", targets.lock().await);
+				
 				continue;
 			} else if packet.payload.starts_with(MSG_PREFIX) {
 				let src = packet.src;
@@ -2060,6 +2061,7 @@ async fn spawn_receiver(
 			} else if packet.payload.starts_with(HELLO_ACK_PREFIX) {
 					let src = packet.src;
 					update_targets(src, &targets, &targets_tx, server_mode).await;
+					//eprintln!("TARGETS={:?}", targets.lock().await);
 			}
 		}
 }
@@ -2906,7 +2908,7 @@ pub fn start_rotation_manager(
             }
             tokio::time::sleep(Duration::from_millis(ROTATION_TICK_MS)).await;
             now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let new_period =(now / HASH_PERIOD_SECS) & !1; // align to even period window
+            let new_period = (now / HASH_PERIOD_SECS) & !1; // align to even period window
             if new_period == period { continue; }
             let new_port = derive_port_from_period(&secret_bytes, base_port, port_range, new_period);
             if new_port == port { period = new_period; continue; }
@@ -2925,8 +2927,8 @@ pub fn start_rotation_manager(
                 *w = new_sock.clone();
             }
             //eprintln!("[rotate] new port {} active", new_port);
-            let until = Instant::now() + Duration::from_secs(ROTATION_OVERLAP_SECS);
-            spawn_overlap_receiver(sock.clone(), until, packet_handler.clone());
+            //let until = Instant::now() + Duration::from_secs(ROTATION_OVERLAP_SECS);
+            //spawn_overlap_receiver(sock.clone(), until, packet_handler.clone());
 
             sock = new_sock;
             port = new_port;
@@ -3146,7 +3148,7 @@ async fn run_client(cli: Cli, server: String) {
 
 		loop {
 			// Compute all valid rotation ports for the server
-			let ports = compute_synched_ports(secret_bytes, base_port, port_range, 1);
+			let ports = compute_synched_ports(secret_bytes, base_port, port_range, 2);
 
 			for port in ports {
 				let server_sock = format!("{}:{}", server_host, port)
