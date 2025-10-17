@@ -6,6 +6,7 @@
 // Progress bar calls are preserved (commented out).
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 
 #[derive(Clone, Debug)]
@@ -58,8 +59,14 @@ use tokio::{
     net::UdpSocket,
     sync::{broadcast, Mutex, Notify, broadcast::error::RecvError::Closed, broadcast::error::RecvError::Lagged, mpsc, RwLock},
     task,
-    time::{Duration, Instant},
+    time::{Duration, Instant, sleep},
+    select,
 };
+
+use once_cell::sync::Lazy;
+
+// Global atomic drift offset (seconds)
+pub static GLOBAL_DRIFT: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
@@ -79,7 +86,7 @@ use std::{
     fmt,
     io::{Write, stdout, IoSliceMut},
     path::Path,
-    sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::Ordering, atomic::AtomicUsize},
+    sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::AtomicI64, atomic::Ordering, atomic::AtomicUsize},
     time::SystemTime,
 };
 
@@ -173,6 +180,9 @@ const SEND_INTERVAL_MS: u64 = 20;
 const HASH_PERIOD_SECS: u64 = 60;             
 const ROTATION_TICK_MS: u64 = 250;            // how often we check time
 const ROTATION_OVERLAP_SECS: u64 = 5;         // grace period overlap
+
+const MAX_CHAT_LINES: usize = 500;
+const REDRAW_INTERVAL: Duration = Duration::from_millis(50); // 20 fps
 
 // -------------------- TYPES --------------------
 pub type TransferCounter = Arc<Mutex<u32>>;
@@ -1148,6 +1158,7 @@ fn encrypt_for_port(
 
 /// Try decrypting a base64 string by checking current, previous, and next
 /// rotation periods, each with its derived port handshake.
+
 fn try_decrypt_string_with_window(
     secret_bytes: &[u8],
     base_port: u16,
@@ -1155,6 +1166,19 @@ fn try_decrypt_string_with_window(
     ciphertext_b64: &str,
     local_port: u16,
 ) -> Option<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()? 
+        .as_secs() as i64;
+
+    // apply global drift offset
+    let drift = GLOBAL_DRIFT.load(Ordering::Relaxed);
+    let adjusted_now = (now + drift).max(0) as u64;
+
+    let current_period = (adjusted_now / HASH_PERIOD_SECS) & !1;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
@@ -1223,6 +1247,8 @@ fn resolve_target_port_for_send(addr: &std::net::SocketAddr) -> u16 {
 }
 
 
+/*
+// ---- REMOVED (auto) ----
 // -------------------- TERMINAL --------------------
 struct TerminalGuard;
 
@@ -1238,7 +1264,9 @@ impl Drop for TerminalGuard {
         let _ = execute!(stdout, Clear(ClearType::All), cursor::MoveTo(0,0));
 }
 
-}
+
+// ---- END REMOVED ----
+}*/
 
 // -------------------- SEND CHAT MESSAGE --------------------
 async fn send_chat_message_to_target(
@@ -2368,6 +2396,8 @@ pub async fn try_handle_file_chunk(
 }
 
 // Redraw the input line (yellow) and chat messages (wrapped & scrollable)
+/*
+// ---- REMOVED (auto) ----
 async fn redraw_input_and_chat(
     stdout: &mut std::io::Stdout,
     chat_lines: &[ChatLine],
@@ -2442,7 +2472,11 @@ async fn redraw_input_and_chat(
     stdout.flush().unwrap();
 }
 
+// ---- END REMOVED ----
+*/
 // -------------------- TERMINAL LOOP --------------------
+/*
+// ---- REMOVED (auto) ----
 async fn terminal_loop(args: TerminalArgs) {
     let TerminalArgs {
         shared_socket,
@@ -2617,6 +2651,8 @@ async fn terminal_loop(args: TerminalArgs) {
 
 
 
+// ---- END REMOVED ----
+*/
 async fn make_reusable_socket(addr: &str, port: u16) -> std::io::Result<tokio::net::UdpSocket> {
 	return Ok(bind_udp(format!("{}:{}", addr, port).parse::<std::net::SocketAddr>().unwrap().into()).await?);
 }
@@ -68797,4 +68833,230 @@ pub const HANDSHAKES: [&str; 65535] = [
 // opt-level = 3
 // panic = "abort"
 
+// Expect these to exist in your codebase:
+/// ChatLine: your chat item struct/enum (must implement Display or to_string())
+/// TerminalArgs: struct used to start terminal_loop
+/// handle_key(...): your existing key handler
 
+#[derive(Clone, Default)]
+pub struct UiState {
+    pub chat_lines: VecDeque<ChatLine>,
+    pub input_buffer: String,
+    pub search_mode: bool,
+    pub search_buffer: String,
+    pub scroll_offset: usize,
+}
+
+pub async fn ui_push_chat_line(ui: &Arc<Mutex<UiState>>, line: ChatLine) {
+    let mut s = ui.lock().await;
+    if s.chat_lines.len() >= MAX_CHAT_LINES { s.chat_lines.pop_front(); }
+    s.chat_lines.push_back(line);
+}
+pub async fn ui_set_input(ui: &Arc<Mutex<UiState>>, input: &str) {
+    ui.lock().await.input_buffer = input.to_string();
+}
+pub async fn ui_set_search(ui: &Arc<Mutex<UiState>>, on: bool, buf: &str) {
+    let mut s = ui.lock().await;
+    s.search_mode = on;
+    s.search_buffer = buf.to_string();
+}
+pub async fn ui_set_scroll(ui: &Arc<Mutex<UiState>>, offset: usize) {
+    ui.lock().await.scroll_offset = offset;
+}
+
+fn wrap_chat_lines(chat: &VecDeque<ChatLine>, cols: usize) -> Vec<String> {
+    use textwrap::fill;
+    let mut out = Vec::new();
+    for entry in chat.iter() {
+        let block = fill(&entry.to_string(), cols.max(1));
+        out.extend(block.lines().map(|s| s.to_string()));
+    }
+    out
+}
+fn compute_visible<'a>(wrapped: &'a [String], scroll_offset: usize, usable_rows: usize) -> &'a [String] {
+    let total = wrapped.len();
+    let max_scroll = total.saturating_sub(usable_rows);
+    let clamped = scroll_offset.min(max_scroll);
+    let end = total.saturating_sub(clamped);
+    let start = end.saturating_sub(usable_rows);
+    &wrapped[start..end]
+}
+
+pub fn spawn_redraw_manager(mut rx: mpsc::Receiver<()>, ui: Arc<Mutex<UiState>>) {
+    tokio::spawn(async move {
+        let _ = terminal::enable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let mut last_draw = Instant::now();
+        loop {
+            select! {
+                _ = rx.recv() => {},
+                _ = sleep(REDRAW_INTERVAL) => {},
+            }
+            if last_draw.elapsed() < REDRAW_INTERVAL { continue; }
+            last_draw = Instant::now();
+
+            let state = ui.lock().await.clone();
+            let (cols, rows) = terminal::size().unwrap_or((80, 24));
+            if rows < 2 { continue; }
+            let cols_usize = cols as usize;
+            let usable_rows = rows.saturating_sub(1) as usize;
+
+            let wrapped = wrap_chat_lines(&state.chat_lines, cols_usize);
+            let visible = compute_visible(&wrapped, state.scroll_offset, usable_rows);
+
+            let _ = crossterm::queue!(stdout, MoveTo(0, 1), Clear(ClearType::FromCursorDown));
+            for (i, line) in visible.iter().enumerate() {
+				// Safe truncation by characters to avoid UTF-8 slicing panic
+				let safe = line.chars().take(cols_usize).collect::<String>();
+				let _ = crossterm::queue!(
+					stdout,
+					MoveTo(0, 1 + (i as u16)),
+					Clear(ClearType::CurrentLine),
+					crossterm::style::Print(safe)
+				);
+			}
+
+            let prompt = if state.search_mode {
+                format!("(reverse-i-search)`{}': {}", state.search_buffer, state.input_buffer)
+            } else {
+                format!("> {}", state.input_buffer)
+            };
+            let styled = prompt.with(Color::Yellow);
+            let _ = crossterm::queue!(stdout, MoveTo(0, 0), Clear(ClearType::CurrentLine), PrintStyledContent(styled));
+            let _ = stdout.flush();
+        }
+    });
+}
+
+pub fn spawn_key_reader() -> mpsc::Receiver<KeyEvent> {
+    let (tx, rx) = mpsc::channel::<KeyEvent>(128);
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(Event::Key(key)) = event::read() {
+                let _ = tx.blocking_send(key);
+            }
+        }
+    });
+    rx
+}
+
+pub struct TerminalGuard;
+impl TerminalGuard { pub fn new() -> Self { let _ = terminal::enable_raw_mode(); TerminalGuard } }
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+        let mut stdout = std::io::stdout();
+        let _ = crossterm::execute!(stdout, Clear(ClearType::All), MoveTo(0,0));
+    }
+}
+
+// Replace the old terminal_loop entirely.
+pub async fn terminal_loop(args: TerminalArgs) {
+    let TerminalArgs {
+        shared_socket,
+        targets,
+        redraw_notify: _old_redraw,
+        file_transfers,
+        transfer_counter,
+        chat_rx,
+        ack_map,
+        secret,
+        progress_registry,
+        channel_registry,
+        chat_tx,
+    } = args;
+
+    let _guard = TerminalGuard::new();
+
+    let ui = Arc::new(Mutex::new(UiState::default()));
+    let (redraw_tx, redraw_rx) = mpsc::channel::<()>(64);
+    spawn_redraw_manager(redraw_rx, ui.clone());
+
+    let mut input_buffer = String::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut history_index: Option<usize> = None;
+    let mut search_mode = false;
+    let mut search_buffer = String::new();
+    let mut search_result_index: Option<usize> = None;
+    let mut desired_scroll_offset: usize = 0;
+
+    let (_cols, rows) = terminal::size().unwrap_or((100, 30));
+    let visible_rows = rows.saturating_sub(1) as usize;
+
+    let mut key_rx = spawn_key_reader();
+    let chat_rx = chat_rx; // Arc<Mutex<broadcast::Receiver<ChatLine>>>
+
+    loop {
+        select! {
+            res = async { let mut r = chat_rx.lock().await; r.recv().await } => {
+                if let Ok(line) = res {
+                    ui_push_chat_line(&ui, line).await;
+                    let _ = redraw_tx.try_send(());
+                }
+            },
+            maybe_key = key_rx.recv() => {
+                if let Some(key_event) = maybe_key {
+                    handle_key(
+                        key_event,
+                        &mut input_buffer,
+                        &Arc::new(Mutex::new(Vec::new())),
+                        shared_socket.clone(),
+                        &targets,
+                        &Arc::new(Notify::new()),
+                        &transfer_counter,
+                        &mut history,
+                        &mut history_index,
+                        &mut search_mode,
+                        &mut search_buffer,
+                        &mut search_result_index,
+                        &mut desired_scroll_offset,
+                        visible_rows,
+                        targets.clone(),
+                        ack_map.clone(),
+                        secret.clone(),
+                        progress_registry.clone(),
+                        channel_registry.clone(),
+                        chat_tx.clone(),
+                    ).await;
+                    ui_set_input(&ui, &input_buffer).await;
+                    ui_set_search(&ui, search_mode, &search_buffer).await;
+                    ui_set_scroll(&ui, desired_scroll_offset).await;
+                    let _ = redraw_tx.try_send(());
+                }
+            },
+        }
+    }
+}
+
+
+
+// === Drift Synchronization System ===
+// Periodically measures local time drift and adjusts global offset.
+
+pub fn spawn_drift_monitor(drift_tx: mpsc::Sender<i64>) {
+    tokio::spawn(async move {
+        let mut last = SystemTime::now();
+        loop {
+            sleep(Duration::from_secs(10)).await;
+            let now = SystemTime::now();
+            let drift = now.duration_since(last)
+                .map(|d| d.as_secs() as i64 - 10)
+                .unwrap_or(0);
+            if drift.abs() > 0 {
+                let _ = drift_tx.send(drift).await;
+            }
+            last = now;
+        }
+    });
+}
+
+pub fn spawn_drift_receiver(mut drift_rx: mpsc::Receiver<i64>) {
+    tokio::spawn(async move {
+        while let Some(drift) = drift_rx.recv().await {
+            let current = GLOBAL_DRIFT.load(Ordering::Relaxed);
+            let new = (current + drift).clamp(-60, 60);
+            GLOBAL_DRIFT.store(new, Ordering::Relaxed);
+            eprintln!("[sync] drift corrected: {current:+} -> {new:+}s");
+        }
+    });
+}
