@@ -1,3 +1,45 @@
+
+// === Unified Frame Header (no encryption for file chunks) ===
+#[repr(u8)]
+enum Kind { Chat = 1, FileChunk = 2, FileAck = 3, Hello = 4 , HelloAck = 5 }
+
+#[derive(Clone, Copy)]
+struct FrameHeader {
+    magic: [u8; 2],   // b"PX"
+    version: u8,      // 1
+    kind: u8,         // Kind::* as u8
+    period: u32,      // sender’s period (optional for file, can be 0)
+    seq: u32,         // chat: message seq; file: chunk index
+    len: u32,         // payload length
+}
+
+const FRAME_MAGIC: [u8;2] = *b"PX";
+const FRAME_VERSION: u8 = 1;
+
+fn write_header(buf: &mut Vec<u8>, kind: Kind, period: u32, seq: u32, len: u32) {
+    buf.extend_from_slice(&FRAME_MAGIC);
+    buf.push(FRAME_VERSION);
+    buf.push(kind as u8);
+    buf.extend_from_slice(&period.to_le_bytes());
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
+}
+
+fn parse_header(buf: &[u8]) -> Result<(FrameHeader, &[u8]), ()> {
+    let need = 2 + 1 + 1 + 4 + 4 + 4;
+    if buf.len() < need { return Err(()); }
+    if buf[0..2] != FRAME_MAGIC { return Err(()); }
+    let version = buf[2];
+    let kind = buf[3];
+    let period = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let seq    = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let len    = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+    let hdr = FrameHeader { magic: FRAME_MAGIC, version, kind, period, seq, len };
+    let rest = &buf[16..];
+    if rest.len() < len as usize { return Err(()); }
+    Ok((hdr, rest))
+}
+
 // === DASHMAP REFACTOR: Optimized concurrency version ===
 // Replaces global Mutex<HashMap> with DashMap for:
 //   - ack_map
@@ -65,6 +107,10 @@ use tokio::{
 
 use once_cell::sync::Lazy;
 
+// Monotonic counters for sequencing
+static FILE_SEQ: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(0));
+static CHAT_SEQ: Lazy<AtomicU32> = Lazy::new(|| AtomicU32::new(0));
+
 // Global atomic drift offset (seconds)
 pub static GLOBAL_DRIFT: Lazy<AtomicI64> = Lazy::new(|| AtomicI64::new(0));
 
@@ -89,6 +135,8 @@ use std::{
     sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::AtomicI64, atomic::Ordering, atomic::AtomicUsize},
     time::SystemTime,
 };
+
+use std::str::FromStr;
 
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, Ipv4Addr, Ipv6Addr, IpAddr};
 
@@ -143,6 +191,19 @@ use aes_gcm::aead::{Aead};
 use hkdf::Hkdf;
 use sha2::{Sha256, Digest};
 use std::time::UNIX_EPOCH;
+
+#[inline]
+fn current_period_u32() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let drift = GLOBAL_DRIFT.load(Ordering::Relaxed);
+    let adjusted_now = (now + drift).max(0) as u64;
+    ((adjusted_now / HASH_PERIOD_SECS) & !1) as u32
+}
+
 
 
 // -------------------- CONSTANTS --------------------More at the bottom
@@ -677,6 +738,7 @@ pub struct FileTransferManager {
     targets: Arc<Mutex<HashSet<SocketAddr>>>,
     retry_counts: Arc<Mutex<HashMap<(u32, u32, SocketAddr), usize>>>,
     registry: Arc<ProgressRegistry>,
+    channel_registry: AckChannelRegistry, // connects relay + send_file + try_handle_ack
 }
 
 impl FileTransferManager {
@@ -686,6 +748,7 @@ impl FileTransferManager {
         ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>>,
         targets: Arc<Mutex<HashSet<SocketAddr>>>,
         registry: Arc<ProgressRegistry>,
+        channel_registry: AckChannelRegistry,
     ) -> Self {
         Self {
             socket,
@@ -694,27 +757,30 @@ impl FileTransferManager {
             targets,
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             registry,
+            channel_registry,
         }
     }
 
     
+	/// Starts the background fan-out relay for forwarding file chunks to other peers.
+	/// This version fully matches the unified framed protocol and ACK logic.
 	pub fn start(self: Arc<Self>) {
 		let socket = self.socket.clone();
 		let forward_cache = self.forward_cache.clone();
 		let ack_map = self.ack_map.clone();
 		let targets = self.targets.clone();
-		let _registry = self.registry.clone(); // kept for symmetry, not used here
+		let channel_registry = self.channel_registry.clone();
+		let _registry = self.registry.clone(); // kept for symmetry
 
-		// per-run ephemeral state (bounded via pruning)
+		// Ephemeral runtime state (for future retries or diagnostics)
 		let retry_info: Arc<Mutex<HashMap<(u32, u64, SocketAddr), RetryInfo>>> =
 			Arc::new(Mutex::new(HashMap::new()));
-		// store when we dropped a peer for (fid, idx)
-		let dropped_peers: Arc<Mutex<HashMap<(u32, u64, SocketAddr), std::time::Instant>>> =
+		let dropped_peers: Arc<Mutex<HashMap<(u32, u64, SocketAddr), Instant>>> =
 			Arc::new(Mutex::new(HashMap::new()));
 
 		tokio::spawn(async move {
 			loop {
-				// snapshot peers (avoiding contention)
+				// Snapshot peers (avoid holding lock during sends)
 				let peers_snapshot: Vec<SocketAddr> = {
 					let guard = targets.lock().await;
 					guard.iter().copied().collect()
@@ -722,10 +788,11 @@ impl FileTransferManager {
 
 				if peers_snapshot.is_empty() {
 					tokio::time::sleep(Duration::from_millis(SEND_INTERVAL_MS)).await;
+                tokio::task::yield_now().await; // yield in fanout outer loop
 					continue;
 				}
 
-				// snapshot all chunks (fid, idx, chunk)
+				// Snapshot all cached chunks
 				let mut chunks: Vec<(u32, u64, FileChunk)> = Vec::new();
 				for outer in forward_cache.iter() {
 					let fid = *outer.key();
@@ -734,25 +801,28 @@ impl FileTransferManager {
 					}
 				}
 
+				// Resolve local socket + address
 				let socket_guard = socket.read().await;
 				let socket_ref = socket_guard.clone();
-				let our_addr = socket_ref.local_addr().unwrap();
+				let our_addr = match socket_ref.local_addr() {
+					Ok(a) => a,
+					Err(_) => {
+						tokio::time::sleep(Duration::from_millis(SEND_INTERVAL_MS)).await;
+                tokio::task::yield_now().await; // yield in fanout outer loop
+						continue;
+					}
+				};
 
 				let mut sent_total = 0u64;
+
+				// Iterate all pending chunks
 				for (fid, idx, chunk) in chunks.into_iter() {
+					// Skip self and origin
 					let peers_to_send: Vec<SocketAddr> = peers_snapshot
 						.iter()
 						.copied()
 						.filter(|p| Some(*p) != chunk.src && *p != our_addr)
 						.collect();
-
-					//eprintln!(
-					//	"[FANOUT][STATE] fid={} idx={} peers={} cache={}",
-					//	fid,
-					//	idx,
-					//	peers_to_send.len(),
-					//	forward_cache.len()
-					//);
 
 					if peers_to_send.is_empty() {
 						continue;
@@ -764,55 +834,77 @@ impl FileTransferManager {
 						let mut chunk_fwd = chunk.clone();
 						chunk_fwd.src = Some(our_addr);
 
-						let mut data = Vec::with_capacity(DATA_PREFIX.len() + chunk_fwd.payload.len() + 64);
-						data.extend_from_slice(DATA_PREFIX);
-						data.extend_from_slice(&chunk_fwd.to_bytes());
+						// Encode + frame the FileChunk
+						let encoded = chunk_fwd.to_bytes();
+						let period = current_period_u32();
+						let seq = FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-						let target_port: u16 = resolve_target_port_for_send(&peer_addr);
-						if let Err(e) = socket_ref.send_to(&data, peer_addr).await {
-							eprintln!(
-								"[FANOUT][ERR] fid={} idx={} relay={} -> {} err={:?}",
-								chunk_fwd.file_id,
-								chunk_fwd.chunk_index,
-								socket_ref.local_addr().unwrap(),
-								peer_addr,
-								e
-							);
-						} else {
-							//eprintln!(
-							//	"[FANOUT][OK] fid={} idx={} relay={} -> {}",
-							//	chunk_fwd.file_id,
-							//	chunk_fwd.chunk_index,
-							//	socket_ref.local_addr().unwrap(),
-							//	peer_addr
-							//);
-							sent_ok = true;
-							sent_total += 1;
+						let mut frame = Vec::with_capacity(16 + encoded.len());
+						write_header(&mut frame, Kind::FileChunk, period, seq, encoded.len() as u32);
+						frame.extend_from_slice(&encoded);
+
+						// Try sending
+						match socket_ref.send_to(&frame, peer_addr).await {
+							Ok(_) => {
+								sent_ok = true;
+								sent_total += 1;
+
+								// 🔧 Optional: local ACK injection if acting as relay
+								if let Some(tx) = {
+									let reg = channel_registry.read().await;
+									reg.get(&fid).cloned()
+								} {
+									let relay_ack = AckPacket {
+										file_id: fid,
+										chunk_index: idx,
+										transfer_token: chunk_fwd.transfer_token,
+										src: our_addr, // normalized relay source
+										total_chunks: chunk_fwd.total_chunks,
+									};
+									let _ = tx.try_send(relay_ack);
+								}
+
+								// eprintln!(
+								//     "[FANOUT][OK] fid={} idx={} seq={} relay={} -> {}",
+								//     chunk_fwd.file_id, chunk_fwd.chunk_index, seq, our_addr, peer_addr
+								// );
+							}
+							Err(e) => {
+								eprintln!(
+									"[FANOUT][ERR] fid={} idx={} relay={} -> {} err={:?}",
+									chunk_fwd.file_id, chunk_fwd.chunk_index, our_addr, peer_addr, e
+								);
+							}
 						}
 
-						// micro pacing
+						// Micro-pacing per peer
 						tokio::time::sleep(Duration::from_millis(1)).await;
 					}
 
-					// ✅ Prune this chunk after successful forward
+					// ✅ Prune chunk from cache after forwarding
 					if sent_ok {
 						if let Some(inner_map) = forward_cache.get(&fid) {
 							inner_map.value().remove(&idx);
-							//eprintln!("[FANOUT][PRUNE] fid={} idx={} removed", fid, idx);
 						}
 					}
 				}
 
 				if sent_total > 0 {
-					//eprintln!("[FANOUT][SUMMARY] sent={} remaining_cache={}", sent_total, forward_cache.len());
+					// eprintln!(
+					//     "[FANOUT][SUMMARY] relayed={} remaining_cache={}",
+					//     sent_total,
+					//     forward_cache.len()
+					// );
 				}
 
 				// pacing between fan-out cycles
 				tokio::time::sleep(Duration::from_millis(SEND_INTERVAL_MS)).await;
+                tokio::task::yield_now().await; // yield in fanout outer loop
 			}
 		});
 	}
 }
+
 
 
 
@@ -1391,12 +1483,13 @@ async fn handle_key(
                     let shared_socket_clone = shared_socket.clone();
                     let targets_clone = targets_clone_for_send.clone();
                     let ack_map_clone = ack_map.clone();
+                    let path_clone = path.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) = send_file(
                             shared_socket_clone,
                             targets_clone,
-                            path,
+                            path_clone,
                             file_id,
                             ack_map_clone,
                             channel_registry,
@@ -1408,6 +1501,7 @@ async fn handle_key(
                             eprintln!("Failed to send file: {}", e);
                         }
                     });
+					
                 } else if input.starts_with("/quit") {
                     let _ = disable_raw_mode();
                     let mut stdout = stdout();
@@ -1416,24 +1510,37 @@ async fn handle_key(
                 } else {
                     let targets_lock = targets.lock().await;
                     for &addr in targets_lock.iter() {
-						// Encrypt the outgoing message for this target port
 						let target_port = addr.port();
+
+						// Encrypt outgoing message for this target
 						let encrypted = match encrypt_for_port(secret.as_bytes(), target_port, &input) {
 							Ok(ct) => ct,
 							Err(e) => {
 								eprintln!("[ERROR] encrypting message for {} failed: {}", addr, e);
-								continue; // Skip this target but keep others
+								continue;
 							}
 						};
 
-						// Send using the currently active socket
-						let mut ready_send :Vec<u8> = Vec::new();
-						ready_send.extend_from_slice(MSG_PREFIX);
-						ready_send.extend_from_slice(encrypted.as_bytes());
-						
-						if let Err(e) = send_via_shared(&shared_socket,&ready_send, addr).await {
+						// --- Unified Framed Message ---
+						let msg_bytes = encrypted.as_bytes();
+						let period = current_period_u32();
+						let seq = CHAT_SEQ.fetch_add(1, Ordering::Relaxed);
+
+						let mut frame = Vec::with_capacity(16 + msg_bytes.len());
+						write_header(&mut frame, Kind::Chat, period, seq, msg_bytes.len() as u32);
+						frame.extend_from_slice(msg_bytes);
+
+						if let Err(e) = send_via_shared(&shared_socket, &frame, addr).await {
 							eprintln!("[WARN] failed to send to {}: {}", addr, e);
-							}
+						} else {
+							eprintln!(
+								"[TERMINAL-SEND] to {} period={} seq={} bytes={}",
+								addr,
+								period,
+								seq,
+								msg_bytes.len()
+							);
+						}
 					}
 
 					// Push chat UI message
@@ -1708,30 +1815,43 @@ pub async fn send_file(
 ) -> anyhow::Result<()> {
     use std::{
         collections::{HashMap, HashSet},
+        net::SocketAddr,
+        sync::atomic::{AtomicU64, Ordering},
         time::{Duration, Instant},
     };
     use bytes::Bytes;
     use dashmap::DashMap;
+    use futures::FutureExt; // for .catch_unwind()
     use tokio::{io::AsyncReadExt, sync::{mpsc, Notify}};
 
     // ---- Tunables ----
     const CHUNK: usize         = 1200;   // keep < MTU
     const INITIAL_CWND: u32    = 8;
     const MAX_CWND: u32        = 512;
-    const ACK_TIMEOUT: u64     = 120;    // ms
-    const TICK_US: u64         = 200;    // pacer tick
-    const RETRY_SCAN_MS: u64   = 25;
-    const MAX_RETRIES: usize   = 25;
+    const ACK_TIMEOUT: u64     = 120;    // ms for per-chunk timeout
+    const TICK_US: u64         = 2000;   // pacer tick: 2ms (prevents UI starvation)
+    const MAX_RETRIES: usize   = 25;     // per-chunk retry ceiling per peer
+    const STALL_MS: u64        = 10_000; // watchdog: no progress for 10s => free exhausted peers
 
-    let filename = std::path::Path::new(&path).to_string_lossy().to_string();
+    static PROGRESS_TICKS: AtomicU64 = AtomicU64::new(0);
 
+    // Minimal crash visibility without relying on RUST_BACKTRACE
+    std::panic::set_hook(Box::new(|info| {
+        let _ = eprintln!("\n>>> PANIC in send_file: {info:?}");
+    }));
+    
     // Open once (async) for size
     let mut f_async = tokio::fs::File::open(&path).await?;
     let meta = f_async.metadata().await?;
     let file_size = meta.len();
     drop(f_async);
     let std_file = std::fs::File::open(&path)?; // for read_at
+    
+    let filename = std::path::Path::new(&path).to_string_lossy().to_string();
+    eprintln!("[SEND][START] file_id={} name={} size={} bytes", file_id, filename, file_size);
 
+
+    // Snapshot peers
     let clients: Vec<SocketAddr> = {
         let t = targets.lock().await;
         t.iter().copied().collect()
@@ -1741,7 +1861,7 @@ pub async fn send_file(
         .expect("filesize/chunk math failed");
     let transfer_token: u64 = rand::random();
 
-    // Register FileAck for receivers (progress/mapping)
+    // Register FileAck tracking for progress/mapping (UI)
     if !clients.is_empty() {
         let fa = FileAck::with_token_and_peers(transfer_token, &clients, total_chunks);
         ack_map.insert(file_id, Arc::new(Mutex::new(fa)));
@@ -1754,7 +1874,7 @@ pub async fn send_file(
         reg.insert(file_id, ack_tx);
     }
 
-    // On-demand encoder (no big buffers)
+    // On-demand encoder (no large buffers)
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
 
@@ -1770,7 +1890,7 @@ pub async fn send_file(
     ) -> std::io::Result<Bytes> {
         use std::io::{Read, Seek, SeekFrom};
         let offset = idx * (chunk_size as u64);
-        let f = std_file.try_clone()?; // clone handle for the blocking thread
+        let f = std_file.try_clone()?; // clone handle for blocking read
         let (buf, n): (Vec<u8>, usize) = tokio::task::spawn_blocking(move || {
             let mut buf = vec![0u8; chunk_size];
             #[cfg(unix)]
@@ -1802,6 +1922,27 @@ pub async fn send_file(
         Ok(Bytes::from(fc.to_bytes()))
     }
 
+    // Wrap encoded FileChunk bytes with protocol header and send
+    async fn send_framed_chunk(
+        shared_socket: &Arc<RwLock<Arc<UdpSocket>>>,
+        peer: SocketAddr,
+        encoded_chunk: &[u8],
+    ) -> std::io::Result<()> {
+        let period = current_period_u32();
+        let seq = FILE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut frame = Vec::with_capacity(16 + encoded_chunk.len());
+        write_header(&mut frame, Kind::FileChunk, period, seq, encoded_chunk.len() as u32);
+        frame.extend_from_slice(encoded_chunk);
+
+        let sock = {
+            let guard = shared_socket.read().await;
+            guard.clone()
+        };
+        sock.send_to(&frame, peer).await?;
+        Ok(())
+    }
+
     // Per-peer send window
     #[derive(Clone)]
     struct SendWindow {
@@ -1815,7 +1956,7 @@ pub async fn send_file(
     }
     impl SendWindow {
         fn new(total: u64) -> Self {
-            let mut un = HashSet::with_capacity(total as usize);
+            let mut un = HashSet::with_capacity(total as usize);            
             for i in 0..total { un.insert(i); }
             Self {
                 next_to_send: 0,
@@ -1837,59 +1978,152 @@ pub async fn send_file(
     // Notify to wake pacer on events (ACKs/timeouts)
     let notify = Arc::new(Notify::new());
 
-    // ACK loop: drain in_flight, grow cwnd, notify pacer
+    // ---- Robust ACK loop (panic-guarded) ----
     {
         let windows = windows.clone();
         let ack_map = ack_map.clone();
         let notify_ack = notify.clone();
+        let chat_tx_clone = chat_tx.clone();
+
         tokio::spawn(async move {
-            while let Some(ack) = ack_rx.recv().await {
-                if let Some(mut w) = windows.get_mut(&(ack.file_id, ack.src)) {
-                    let win = w.value_mut();
-                    if win.unacked.remove(&ack.chunk_index) {
-                        if win.in_flight > 0 { win.in_flight -= 1; }
-                        if win.cwnd < MAX_CWND { win.cwnd += 1; }  // additive increase
-                        win.last_sent.remove(&ack.chunk_index);
-                        win.retries.remove(&ack.chunk_index);
+            let task = async move {
+                while let Some(ack) = ack_rx.recv().await {
+					//eprintln!(
+					//	"[ACK][RECV] file={} chunk={} from={}",
+					//	ack.file_id, ack.chunk_index, ack.src
+					//);
+					
+					eprintln!("CHUNK INDEX={}", ack.chunk_index);
+					
+					if ack.chunk_index == total_chunks - 1 {
+						eprintln!("[ACK][FINAL] Received final chunk ack for {}", ack.file_id);
+					}
+					
+                    let mut credited = false;
+
+                    // Fast path: exact window
+                    if let Some(mut w) = windows.get_mut(&(ack.file_id, ack.src)) {
+                        let win = w.value_mut();
+                        if win.unacked.remove(&ack.chunk_index) {
+                            if win.in_flight > 0 { win.in_flight -= 1; }
+                            if win.cwnd < MAX_CWND { win.cwnd += 1; }
+                            win.last_sent.remove(&ack.chunk_index);
+                            win.retries.remove(&ack.chunk_index);
+                            credited = true;
+                            
+                            if ack.chunk_index == 0 {
+								eprintln!("[ACK][SEND-WINDOW] Successfully removed chunk 0 for {}", ack.src);
+							}
+						} else if ack.chunk_index == 0 {
+							eprintln!("[ACK][SEND-WINDOW][WARN] Chunk 0 not found in unacked for {}", ack.src);
+                        }
                     }
+
+                    // Fallback: any window still tracking this chunk for the file
+                    if !credited {
+                        if let Some(mut any_w) = windows.iter_mut().find(|entry| {
+                            let (fid, _) = *entry.key();
+                            fid == ack.file_id && entry.value().unacked.contains(&ack.chunk_index)
+                        }) {
+                            let peer = any_w.key().1;
+                            let win = any_w.value_mut();
+                            if win.unacked.remove(&ack.chunk_index) {
+                                if win.in_flight > 0 { win.in_flight -= 1; }
+                                if win.cwnd < MAX_CWND { win.cwnd += 1; }
+                                win.last_sent.remove(&ack.chunk_index);
+                                win.retries.remove(&ack.chunk_index);
+                                eprintln!("[ACK][FALLBACK] file={} chunk={} used peer={} (ack.src={})",
+                                          ack.file_id, ack.chunk_index, peer, ack.src);
+                                credited = true;
+                            }
+                        }
+                    }
+
+                    if credited {
+                        PROGRESS_TICKS.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        eprintln!("[ACK][NO-WINDOW] file={} chunk={} ack.src={}", ack.file_id, ack.chunk_index, ack.src);
+                    }
+
+                    if let Some(fa) = ack_map.get(&ack.file_id) {
+                        let mut fa_locked = fa.lock().await;
+                        fa_locked.acknowledge(ack.src, ack.chunk_index);
+                    }
+
+                    notify_ack.notify_one();
+                    tokio::task::yield_now().await; // yield after ack
                 }
-                if let Some(fa) = ack_map.get(&ack.file_id) {
-                    let mut fa_locked = fa.lock().await;
-                    fa_locked.acknowledge(ack.src, ack.chunk_index);
-                }
-                notify_ack.notify_one();
+            };
+
+            if let Err(e) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
+                eprintln!("[SEND][PANIC] ACK loop panicked: {:?}", e);
             }
         });
     }
 
-    // Pacer + timeout/resend in one loop (never exits until ALL peers done)
+    // ---- Pacer + timeout/resend loop (panic-guarded) ----
     {
         let windows = windows.clone();
         let filename = filename.clone();
         let notify_pacer = notify.clone();
         let std_file = std_file.try_clone()?;
+        let shared_socket = shared_socket.clone();
+        let clients = clients.clone();
+
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_micros(TICK_US));
-            let timeout = Duration::from_millis(ACK_TIMEOUT);
-            loop {
-                tokio::select! {
-                    _ = tick.tick() => {},
-                    _ = notify_pacer.notified() => {},
-                }
+            let task = async move {
+                let mut tick = tokio::time::interval(Duration::from_micros(TICK_US));
+                let timeout = Duration::from_millis(ACK_TIMEOUT);
 
-                // If everyone finished, we can stop
-                let done = windows.iter().all(|e| {
-                    let (fid, _p) = *e.key();
-                    fid != file_id || e.value().all_done()
-                });
-                if done { break; }
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = notify_pacer.notified() => {},
+                    }
+                    
+                    /*for e in windows.iter() {
+						let (fid, peer) = *e.key();
+						if fid != file_id { continue; }
 
-                for &peer in &clients {
-                    if let Some(mut e) = windows.get_mut(&(file_id, peer)) {
+						let win = e.value();
+						if !win.unacked.is_empty() {
+							eprintln!(
+								"[SEND][PENDING] peer={} remaining={:?}",
+								peer,
+								{
+									let mut unacked: Vec<_> = win.unacked.iter().copied().collect();
+									unacked.sort_unstable();
+									unacked
+								}
+							);
+						}
+					}*/
+
+                    // If everyone finished, we can stop
+                    let done = windows.iter().all(|e| {
+                        let (fid, _) = *e.key();
+                        fid != file_id || e.value().all_done()
+                    });
+                    if done { break; }
+
+                    // Snapshot local addr once per loop (for encode metadata)
+                    let local_addr = {
+                        let sock = {
+                            let guard = shared_socket.read().await;
+                            guard.clone()
+                        };
+                        match sock.local_addr() { Ok(a) => a, Err(_) => continue }
+                    };
+
+                    for &peer in &clients {
+                        // entry may be missing if it was cleared earlier; skip safely
+                        let entry_opt = windows.get_mut(&(file_id, peer));
+                        if entry_opt.is_none() { continue; }
+                        let mut e = entry_opt.unwrap();
+
                         let win = e.value_mut();
 
                         // 1) Handle timeouts → MD, allow resend by clearing last_sent
-                        //    (no double-counting in_flight on resend)
                         let timed_out: Vec<u64> = win.unacked.iter()
                             .filter_map(|&idx| {
                                 win.last_sent.get(&idx)
@@ -1901,37 +2135,30 @@ pub async fn send_file(
                             // Multiplicative decrease
                             win.ssthresh = (win.cwnd / 2).max(INITIAL_CWND);
                             win.cwnd = INITIAL_CWND;
+
                             // allow resend
                             win.last_sent.remove(&idx);
 
                             let r = win.retries.entry(idx).or_insert(0);
                             *r += 1;
                             if *r > MAX_RETRIES {
-                                // give up for this peer
+                                // give up for this peer/chunk
                                 win.unacked.remove(&idx);
                                 if win.in_flight > 0 { win.in_flight -= 1; }
                                 eprintln!("[SEND][DROP] fid={} idx={} peer={} (max retries)", file_id, idx, peer);
                             } else {
                                 // opportunistic immediate resend (do not change in_flight)
-                                let sock = {
-											let guard = shared_socket.read().await;
-											guard.clone()
-								};
-                                if let Ok(local) = sock.local_addr() {
-                                    if let Ok(encoded) = encode_chunk_on_demand(
-                                        &std_file, file_id, transfer_token, total_chunks, &filename, idx, CHUNK, local
-                                    ).await {
-                                        let mut datagram = Vec::with_capacity(DATA_PREFIX.len() + encoded.len());
-                                        datagram.extend_from_slice(DATA_PREFIX);
-                                        datagram.extend_from_slice(&encoded);
-										let sock = {
-												let guard = shared_socket.read().await;
-												guard.clone()
-										};
-                                        if sock.send_to(&datagram, peer).await.is_ok() {
+                                match encode_chunk_on_demand(
+                                    &std_file, file_id, transfer_token, total_chunks, &filename, idx, CHUNK, local_addr
+                                ).await {
+                                    Ok(encoded) => {
+                                        if let Err(e) = send_framed_chunk(&shared_socket, peer, &encoded).await {
+                                            eprintln!("[SEND][RESEND] fid={} idx={} peer={} err={:?}", file_id, idx, peer, e);
+                                        } else {
                                             win.last_sent.insert(idx, Instant::now());
                                         }
                                     }
+                                    Err(e) => eprintln!("[SEND][ENCODE-RESEND] fid={} idx={} err={:?}", file_id, idx, e),
                                 }
                             }
                         }
@@ -1939,13 +2166,7 @@ pub async fn send_file(
                         // 2) Fresh sends within budget
                         let budget = win.cwnd.saturating_sub(win.in_flight);
                         if budget == 0 { continue; }
-                        
-                        let sock = {
-									let guard = shared_socket.read().await;
-									guard.clone()
-						};
 
-                        let local_addr = match sock.local_addr() { Ok(a) => a, Err(_) => continue };
                         let mut injected = 0u32;
                         let mut idx = win.next_to_send;
 
@@ -1955,40 +2176,46 @@ pub async fn send_file(
                                     &std_file, file_id, transfer_token, total_chunks, &filename, idx, CHUNK, local_addr
                                 ).await {
                                     Ok(encoded) => {
-                                        let mut datagram = Vec::with_capacity(DATA_PREFIX.len() + encoded.len());
-                                        datagram.extend_from_slice(DATA_PREFIX);
-                                        datagram.extend_from_slice(&encoded);
-                                        let sock = {
-												let guard = shared_socket.read().await;
-												guard.clone()
-										};
-                                        if sock.send_to(&datagram, peer).await.is_ok() {
+                                        if let Err(e) = send_framed_chunk(&shared_socket, peer, &encoded).await {
+                                            eprintln!("[SEND][FRESH] fid={} idx={} peer={} err={:?}", file_id, idx, peer, e);
+                                        } else {
                                             win.in_flight += 1;
                                             win.last_sent.insert(idx, Instant::now());
                                             injected += 1;
                                         }
                                     }
-                                    Err(e) => {
-                                        eprintln!("[SEND][ENCODE] fid={} idx={} err={:?}", file_id, idx, e);
-                                    }
+                                    Err(e) => eprintln!("[SEND][ENCODE] fid={} idx={} err={:?}", file_id, idx, e),
                                 }
                             }
                             idx += 1;
                         }
                         win.next_to_send = win.next_to_send.max(idx);
+                        tokio::task::yield_now().await; // yield after peer batch
                     }
+                    // cooperative yield each tick
+                    tokio::task::yield_now().await; // yield at end of pacer tick
                 }
+            };
+
+            if let Err(e) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
+                eprintln!("[SEND][PANIC] pacer loop panicked: {:?}", e);
             }
         });
     }
 
-    // Wait until ALL peers finished this file
+    // ---- Wait until ALL peers finished (with stall watchdog; no borrow conflicts) ----
+    let mut last_tick = PROGRESS_TICKS.load(Ordering::Relaxed);
+    let mut last_progress = Instant::now();
+
     loop {
+		
         let all_done = windows.iter().all(|e| {
-            let (fid, _p) = *e.key();
+            let (fid, _) = *e.key();
             fid != file_id || e.value().all_done()
         });
+
         if all_done {
+            eprintln!("[SEND][DONE] file_id={} total_chunks={} (upload complete)", file_id, total_chunks);
             let _ = chat_tx.send(ChatLine::Transfer {
                 ts: chrono::Local::now(),
                 id: file_id,
@@ -2000,7 +2227,31 @@ pub async fn send_file(
             });
             break;
         }
+
+        // progress watchdog
+        let tick = PROGRESS_TICKS.load(Ordering::Relaxed);
+        if tick != last_tick {
+            last_tick = tick;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() > Duration::from_millis(STALL_MS) {
+            // free peers that exhausted retries for all remaining chunks
+            for mut e in windows.iter_mut() {
+                let peer = e.key().1; // capture key BEFORE mutable borrow of value
+                let win = e.value_mut();
+                let hopeless = win.unacked.iter().all(|idx| {
+                    win.retries.get(idx).copied().unwrap_or(0) >= MAX_RETRIES
+                });
+                if hopeless {
+                    eprintln!("[SEND][PEER-DONE-NO-ACK] file={} peer={} (exhausted retries)", file_id, peer);
+                    win.unacked.clear();
+                    win.in_flight = 0;
+                }
+            }
+            last_progress = Instant::now();
+        }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await; // yield in wait loop
     }
 
     // Cleanup
@@ -2013,6 +2264,8 @@ pub async fn send_file(
     Ok(())
 }
 
+
+
 /// Sends using the currently active UDP socket from the rotation manager.
 async fn send_via_shared(
     shared_socket: &Arc<RwLock<Arc<UdpSocket>>>,
@@ -2024,6 +2277,7 @@ async fn send_via_shared(
     //eprintln!("SENT-->{:?}",String::from_utf8_lossy(buf));
     //Ok(buf.len())
 }
+
 
 // -------------------- RECEIVER --------------------
 async fn spawn_receiver(
@@ -2043,62 +2297,73 @@ async fn spawn_receiver(
     base_port: u16,
     port_range: u16,
 ) {
-		while let Some(packet) = udp_packet_rx.recv().await {
-			// Clone inner state for async operations
-			let _targets_snapshot = {
-				let guard = targets.lock().await;
-				guard.clone()
-			};
-					
-			if packet.payload.starts_with(HELLO_PREFIX) {
-				let src = packet.src;
-				update_targets(src, &targets, &targets_tx, server_mode).await;
-				//eprintln!("[HELLO] registered new peer {:?}", src);
-				
-				// --- HELLO handshake to client ---
-				let hello_ack_msg = HELLO_ACK_PREFIX;
+    while let Some(packet) = udp_packet_rx.recv().await {
+        
+        // --- Try unified frame header first ---
+        if let Ok((hdr, payload)) = parse_header(&packet.payload) {
+            match hdr.kind {
+               x if x == Kind::Hello as u8 => {
+					let src = packet.src;
+					update_targets(src, &targets, &targets_tx, server_mode).await;
 
-				if let Err(e) = send_via_shared(&shared_socket, hello_ack_msg, src).await {
-					eprintln!("[CLIENT] failed to send HELLO ACK to client: {:?}", e);
+					// --- Send framed HELLO-ACK response ---
+					let period = current_period_u32();
+					let seq = FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+					let mut frame = Vec::with_capacity(16);
+					write_header(&mut frame, Kind::HelloAck, period, seq, 0);
+
+					if let Err(e) = send_via_shared(&shared_socket, &frame, src).await {
+						eprintln!("[HELLO] failed to send framed ACK to {}: {:?}", src, e);
+					} else {
+						eprintln!("[HELLO] ACK sent to {} period={} seq={}", src, period, seq);
+					}
+
+					continue;
 				}
-				
-				//eprintln!("TARGETS={:?}", targets.lock().await);
-				
-				continue;
-			} else if packet.payload.starts_with(MSG_PREFIX) {
-				let src = packet.src;
-				update_targets(src, &targets, &targets_tx, server_mode).await;
-				
-				try_handle_chat(
-						packet,
-						src,
-						&chat_tx,
-						shared_socket.clone(),
-						&targets,
-						server_mode,
-						secret.clone(),
-						base_port,
-						port_range,
-					).await;
-			} else if packet.payload.starts_with(ACK_PREFIX) {
-				let src = packet.src;
-				update_targets(src, &targets, &targets_tx, server_mode).await;
-					
-					try_handle_ack(
-						packet,
-						src,
-						ack_map.clone(),
-						channel_registry.clone(),
-						progress_registry.clone(),
-						shared_socket.clone(),
-						&targets,
-					).await;
-			} else if packet.payload.starts_with(DATA_PREFIX) {
-				let src = packet.src;
-				update_targets(src, &targets, &targets_tx, server_mode).await;
 
-					try_handle_file_chunk(
-						packet,
+                x if x == Kind::Chat as u8 => {
+					let (hdr, payload) = parse_header(&packet.payload).expect("Couldn't PARSE header frame");
+					let mut pkt = packet.clone();
+					pkt.payload = payload.to_vec();
+					let src = packet.src;
+                    try_handle_chat(
+                        pkt,
+                        src,
+                        &chat_tx,
+                        shared_socket.clone(),
+                        &targets,
+                        server_mode,
+                        secret.clone(),
+                        base_port,
+                        port_range,
+                    ).await;
+                    continue;
+                }
+
+                x if x == Kind::FileAck as u8 => {
+					let (hdr, payload) = parse_header(&packet.payload).expect("Couldn't PARSE header frame");
+					let mut pkt = packet.clone();
+					pkt.payload = payload.to_vec();
+					let src = packet.src;
+                    try_handle_ack(
+                        pkt,
+                        src,
+                        ack_map.clone(),
+                        channel_registry.clone(),
+                        progress_registry.clone(),
+                        shared_socket.clone(),
+                        &targets,
+                    ).await;
+                    continue;
+                }
+
+                x if x == Kind::FileChunk as u8 => {
+					let (hdr, payload) = parse_header(&packet.payload).expect("Couldn't PARSE header frame");
+					let mut pkt = packet.clone();
+					pkt.payload = payload.to_vec();
+					let src = packet.src;
+                    try_handle_file_chunk(
+						pkt,
 						src,
 						shared_socket.clone(),
 						&file_chunk_tx,
@@ -2108,13 +2373,27 @@ async fn spawn_receiver(
 						&ack_map,
 						&targets,
 					).await;
-			} else if packet.payload.starts_with(HELLO_ACK_PREFIX) {
-					let src = packet.src;
+                    continue;
+                }
+                
+                x if x == Kind::HelloAck as u8 => {
+                    let src = packet.src;
 					update_targets(src, &targets, &targets_tx, server_mode).await;
-					//eprintln!("TARGETS={:?}", targets.lock().await);
-			}
+                    continue;
+                }
+
+                _ => {
+					let src = packet.src;
+                    eprintln!("[RECV] unknown frame kind={} from {}", hdr.kind, src);
+                    continue;
+                }
+            }
+		} else {
+			// DISCARDED PACKET.
 		}
+    }
 }
+
 
 
 
@@ -2151,6 +2430,9 @@ async fn update_targets(
     let _ = targets_tx.send(src);
 }
 
+
+// -------------------- HANDLERS (Unified Framing with Debug) --------------------
+
 pub async fn try_handle_chat(
     packet: UdpPacket,
     src: SocketAddr,
@@ -2162,71 +2444,62 @@ pub async fn try_handle_chat(
     base_port: u16,
     port_range: u16,
 ) -> bool {
-    // Convert secret string to bytes once
+    eprintln!("[CHAT-HANDLER] from {} len={} bytes", src, packet.payload.len());
+
     let secret_bytes = secret.as_bytes();
+    let local_port = {
+        let sock = shared_socket.read().await.clone();
+        sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()).port()
+    };
 
-    // Interpret buffer as UTF-8 chat message
-    if let Ok(msg) = std::str::from_utf8(&packet.payload) {
-        // Strip the message prefix before decryption
-        let ciphertext_b64 = &msg[MSG_PREFIX.len()..];
+    let decrypted = match std::str::from_utf8(&packet.payload)
+        .ok()
+        .and_then(|s| try_decrypt_string_with_window(secret_bytes, base_port, port_range, s, local_port))
+    {
+        Some(text) => text,
+        None => {
+            eprintln!("[CHAT-HANDLER] failed to decrypt message from {}", src);
+            return true;
+        }
+    };
 
-        // Get the current local port from the active socket
-        let local_port = {
-            let sock = shared_socket.read().await.clone();
-            sock.local_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap()).port()
-        };
+    let chat_line = ChatLine::Message {
+        ts: Local::now(),
+        msg: decrypted.clone(),
+    };
+    let _ = chat_tx.send(chat_line);
 
-        // Try decryption with tolerant window
-        let decrypted = match try_decrypt_string_with_window(secret_bytes, base_port, port_range, ciphertext_b64, local_port) {
-            Some(text) => text,
-            None => {
-				let source_know_msg_failed = 
-                eprintln!("[WARN] Failed to decrypt incoming message from {}", src);
-                return true; // keep running but skip
+    if server_mode {
+        let peers = targets.lock().await.clone();
+        let period = current_period_u32();
+        let seq = CHAT_SEQ.fetch_add(1, Ordering::Relaxed);
+
+        for peer in peers {
+            if peer == src {
+                continue;
             }
-        };
 
-        // --- Display locally ---
-        let chat_line = ChatLine::Message {
-            ts: Local::now(),
-            msg: decrypted.clone(),
-        };
-        let _ = chat_tx.send(chat_line);
-
-        // --- Relay if server ---
-        if server_mode {
-            let peers = targets.lock().await.clone();
-
-            for peer in peers {
-                if peer == src {
+            let target_port = peer.port();
+            let encrypted = match encrypt_for_port(secret_bytes, target_port, &decrypted) {
+                Ok(ct) => ct,
+                Err(e) => {
+                    eprintln!("[CHAT-HANDLER] encrypt {} failed: {}", peer, e);
                     continue;
                 }
+            };
 
-                // Encrypt for peer
-                let target_port = peer.port();
-                let encrypted = match encrypt_for_port(secret_bytes, target_port, &decrypted) {
-                    Ok(ct) => ct,
-                    Err(e) => {
-                        eprintln!("[ERROR] encrypting for {} failed: {}", peer, e);
-                        continue;
-                    }
-                };
+            let msg_bytes = encrypted.as_bytes();
+            let mut frame = Vec::with_capacity(16 + msg_bytes.len());
+            write_header(&mut frame, Kind::Chat, period, seq, msg_bytes.len() as u32);
+            frame.extend_from_slice(msg_bytes);
 
-                // Build outbound buffer
-                let mut buf_out = Vec::with_capacity(MSG_PREFIX.len() + encrypted.len());
-                buf_out.extend_from_slice(MSG_PREFIX);
-                buf_out.extend_from_slice(encrypted.as_bytes());
-
-                // Send using the currently active socket
-                if let Err(e) = send_via_shared(&shared_socket, &buf_out, peer).await {
-                    eprintln!("[WARN] failed to send to {}: {}", peer, e);
-                }
+            if let Err(e) = send_via_shared(&shared_socket, &frame, peer).await {
+                eprintln!("[CHAT-HANDLER] send to {} failed: {}", peer, e);
             }
         }
     }
     true
 }
-
 
 pub async fn try_handle_ack(
     packet: UdpPacket,
@@ -2237,34 +2510,47 @@ pub async fn try_handle_ack(
     shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
 ) -> bool {
-    // Decode ACK packet
-    let ack = match AckPacket::from_bytes(&packet.payload[ACK_PREFIX.len()..]) {
+    eprintln!("[ACK-HANDLER] from {} len={} bytes", src_addr, packet.payload.len());
+
+    let mut ack = match AckPacket::from_bytes(&packet.payload) {
         Some(a) => a,
         None => {
-            eprintln!("[ACK] malformed from {}", src_addr);
+            eprintln!("[ACK-HANDLER] malformed from {}", src_addr);
             return false;
         }
     };
 
-    // Forward ACK into per-transfer channel
+    // Normalize: use the addr we actually observed on this socket
+    ack.src = src_addr;
+
+    // --- Forward ACK into the correct sender-side channel ---
     if let Some(tx) = {
         let reg = channel_registry.read().await;
         reg.get(&ack.file_id).cloned()
     } {
-        if let Err(e) = tx.try_send(ack.clone()) {
+		if ack.chunk_index == 1 {
+			eprintln!("\n\n\n\n\n\n\n\n[ACK-HANDLER][DEBUG] Forwarding chunk 0 ACK for file={} from={}", ack.file_id, ack.src);
+		}
+        if tx.try_send(ack.clone()).is_err() {
             if let Err(e2) = tx.send(ack.clone()).await {
-                eprintln!("[ACK] failed to forward ack {}: {}", ack.file_id, e2);
+                eprintln!("[ACK-HANDLER] forward ack {} failed: {}", ack.file_id, e2);
             }
-        }
+        } else {
+			//eprintln!(
+			//	"\n\n\n\n\n\n\n[ACK-HANDLER] forwarded ack: file_id={} chunk={} to sender",
+			//	ack.file_id, ack.chunk_index
+			//);
+		}
+    } else {
+        eprintln!("[ACK-HANDLER] no channel for file_id={} (sender may have exited)", ack.file_id);
     }
 
-    // Insert if missing
+    // --- Update ACK progress state using src_addr (now ack.src) ---
     let entry = ack_map.entry(ack.file_id).or_insert_with(|| {
         let peers_snapshot: Vec<SocketAddr> = {
             let lock = targets.blocking_lock();
             lock.iter().copied().collect()
         };
-
         Arc::new(Mutex::new(FileAck::with_token_and_peers(
             ack.transfer_token,
             &peers_snapshot,
@@ -2276,31 +2562,24 @@ pub async fn try_handle_ack(
     let total_chunks_now = fa.total_chunks;
     let chunk_index = ack.chunk_index;
 
-    // Ensure client vector exists
-    if !fa.per_client.contains_key(&src_addr) {
+    if !fa.per_client.contains_key(&ack.src) {
         let len = (total_chunks_now.max(chunk_index + 1)) as usize;
         let mut v = Vec::with_capacity(len);
-        for _ in 0..len {
-            v.push(AtomicBool::new(false));
-        }
-        fa.per_client.insert(src_addr, v);
+        for _ in 0..len { v.push(AtomicBool::new(false)); }
+        fa.per_client.insert(ack.src, v);
     }
 
-    // Grow if needed
     {
-        let entry = fa.per_client.get_mut(&src_addr).unwrap();
+        let entry = fa.per_client.get_mut(&ack.src).unwrap();
         let need = (chunk_index as usize + 1).saturating_sub(entry.len());
         if need > 0 {
             entry.reserve(need);
-            for _ in 0..need {
-                entry.push(AtomicBool::new(false));
-            }
+            for _ in 0..need { entry.push(AtomicBool::new(false)); }
         }
     }
 
-    // Update chunk counters
     fa.total_chunks = fa.total_chunks.max(chunk_index + 1);
-    let entry = fa.per_client.get_mut(&src_addr).unwrap();
+    let entry = fa.per_client.get_mut(&ack.src).unwrap();
     let flag = &entry[chunk_index as usize];
     let was_new = !flag.swap(true, Ordering::Relaxed);
 
@@ -2308,19 +2587,10 @@ pub async fn try_handle_ack(
         fa.total_unique_acks.fetch_add(1, Ordering::Relaxed);
         registry.update_progress(ack.file_id, fa.total_ack_count() as u64).await;
     }
+    fa.last_addr = ack.src;
 
-    fa.last_addr = src_addr;
+    // No echoing ACKs back to the sender—removed.
 
-    // --- Echo ACK confirmation using rotating socket ---
-    let mut ack_bytes = Vec::new();
-    ack_bytes.extend_from_slice(ACK_PREFIX);
-    ack_bytes.extend_from_slice(&ack.to_bytes());
-
-    if let Err(e) = send_via_shared(&shared_socket, &ack_bytes, src_addr).await {
-        eprintln!("[ACK DEBUG] failed to echo ACK to {}: {}", src_addr, e);
-    }
-
-    // Optional cleanup
     if (fa.total_ack_count() as u64) >= (fa.total_chunks * fa.per_client.len() as u64) {
         drop(fa);
         ack_map.remove(&ack.file_id);
@@ -2330,7 +2600,8 @@ pub async fn try_handle_ack(
     true
 }
 
-/// Handle incoming FileChunk packets, send ACK (even for duplicates), and optionally forward.
+
+
 pub async fn try_handle_file_chunk(
     packet: UdpPacket,
     src: SocketAddr,
@@ -2342,19 +2613,24 @@ pub async fn try_handle_file_chunk(
     ack_map: &AckMap,
     targets: &Arc<Mutex<HashSet<SocketAddr>>>,
 ) -> bool {
-    // --- Decode chunk ---
-    let mut chunk = match FileChunk::from_bytes(&packet.payload[DATA_PREFIX.len()..]) {
-        Some(c) => c,
-        None => return false,
-    };
+    eprintln!("[FILE-HANDLER] from {} len={} bytes", src, packet.payload.len());
 
+    let mut chunk = match FileChunk::from_bytes(&packet.payload) {
+        Some(c) => c,
+        None => {
+            eprintln!("[FILE-HANDLER] malformed FileChunk from {}", src);
+            return false;
+        }
+    };
+    
+    if chunk.chunk_index == 0 {
+    eprintln!("[ACK][DEBUG] Chunk 0 received from {}, preparing ACK", src);
+}
     chunk.src = Some(src);
 
-    // Deduplication
     let file_map = forward_cache.entry(chunk.file_id).or_insert_with(DashMap::new);
     let is_new = file_map.insert(chunk.chunk_index, chunk.clone()).is_none();
 
-    // --- If server, ensure ack_map entry exists ---
     if server_mode {
         use dashmap::mapref::entry::Entry;
         if let Entry::Vacant(v) = ack_map.entry(chunk.file_id) {
@@ -2362,16 +2638,13 @@ pub async fn try_handle_file_chunk(
                 let guard = targets.lock().await;
                 guard.iter().copied().collect()
             };
-
             let total = chunk.total_chunks;
             let fa_struct = FileAck::new(src, targets.clone(), true).await;
             let fa = Arc::new(Mutex::new(fa_struct));
-
             {
                 let mut fa_locked = fa.lock().await;
                 fa_locked.transfer_token = chunk.transfer_token;
                 fa_locked.total_chunks = total;
-
                 for peer in peers_now {
                     let mut vec = Vec::with_capacity(total as usize);
                     for _ in 0..total {
@@ -2384,7 +2657,6 @@ pub async fn try_handle_file_chunk(
         }
     }
 
-    // --- Send ACK ---
     let ack = AckPacket {
         file_id: chunk.file_id,
         chunk_index: chunk.chunk_index,
@@ -2396,26 +2668,30 @@ pub async fn try_handle_file_chunk(
         total_chunks: chunk.total_chunks,
     };
 
-    let mut ack_bytes = Vec::with_capacity(ACK_PREFIX.len() + ack.to_bytes().len());
-    ack_bytes.extend_from_slice(ACK_PREFIX);
-    ack_bytes.extend_from_slice(&ack.to_bytes());
+    let ack_bytes = ack.to_bytes();
+    let mut frame = Vec::with_capacity(16 + ack_bytes.len());
+    let period = current_period_u32();
+    let seq = FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+    write_header(&mut frame, Kind::FileAck, period, seq, ack_bytes.len() as u32);
+    frame.extend_from_slice(&ack_bytes);
+    
+    if chunk.chunk_index == 0 {
+    eprintln!("[ACK][DEBUG] Sending ACK for chunk 0 to {}", src);
+}
 
-    if let Err(e) = send_via_shared(&shared_socket, &ack_bytes, src).await {
-        eprintln!(
-            "[ACK][ERR] fid={} idx={} -> {}: {:?}",
-            ack.file_id, ack.chunk_index, src, e
-        );
+    if let Err(e) = send_via_shared(&shared_socket, &frame, src).await {
+        eprintln!("[FILE-HANDLER] ACK send error: {:?}", e);
     }
 
-    // --- Forward to file manager only if new ---
     if is_new {
         if let Err(e) = file_chunk_tx.send(chunk).await {
-            eprintln!("[FM][WARN] broadcast failed: {:?}", e);
+            eprintln!("[FILE-HANDLER] FM broadcast failed: {:?}", e);
         }
     }
 
     true
 }
+
 
 // Redraw the input line (yellow) and chat messages (wrapped & scrollable)
 /*
@@ -3007,9 +3283,9 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let ack_tracker: FileAckTracker = Arc::new(Mutex::new(HashMap::new()));
     let forward_cache: ForwardCache = new_forward_cache();
     let ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>> = Arc::new(DashMap::new());
-    let channel_registry: AckChannelRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let channel_registry: AckChannelRegistry = Arc::new(RwLock::new(HashMap::new())); // ✅ used by both send_file & fanout
 
-    // MultiProgress
+    // MultiProgress UI registry
     let (cols, _rows) = terminal::size().expect("ERROR: terminal size is weird");
     let term = Term::stderr();
     let draw_target = ProgressDrawTarget::term(term, (cols as u16).try_into().unwrap());
@@ -3027,8 +3303,8 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let base_port = cli.base_port;
     let port_range = cli.port_range;
 
-	let ports = compute_synched_ports(&secret_bytes, base_port, port_range, 0);
-	let current_port = ports[0];
+    let ports = compute_synched_ports(&secret_bytes, base_port, port_range, 0);
+    let current_port = ports[0];
     let arc_socket = Arc::new(
         make_reusable_socket("0.0.0.0", current_port)
             .await
@@ -3038,23 +3314,17 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
     let shared_socket = Arc::new(tokio::sync::RwLock::new(arc_socket.clone()));
 
-    // ---------------- Dual-bind rotation manager ----------------
-    use std::net::IpAddr;
-    use std::str::FromStr;
-
-    let bind_ip = IpAddr::from_str("0.0.0.0").unwrap();
+    // ---------------- Rotation manager ----------------
+    let bind_ip = std::net::IpAddr::from_str("0.0.0.0").unwrap();
     let secret_bytes_arc = Arc::new(secret_bytes.clone());
-
-    // forward each overlap packet into your UDP receiver queue
     let udp_tx_clone = udp_packet_tx.clone();
     let packet_handler: PacketHandler = Arc::new(move |data: Vec<u8>, src: SocketAddr, local: SocketAddr| {
-    let _ = udp_tx_clone.try_send(UdpPacket {
-			src,
-			dst: local,          // ✅ correct: our local socket/port that received the datagram
-			payload: data,
-		});
-	});
-
+        let _ = udp_tx_clone.try_send(UdpPacket {
+            src,
+            dst: local,
+            payload: data,
+        });
+    });
 
     start_rotation_manager(
         shared_socket.clone(),
@@ -3066,13 +3336,15 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
         Some(shutdown_flag.clone()),
     );
 
-	let shared_socket_clone = shared_socket.clone();
-    // ---------------- Background tasks ----------------
-    tokio::spawn(async move {
-        grab_packets_and_forward(shared_socket_clone, udp_packet_tx).await;
-    });
+    // ---------------- Background packet grabber ----------------
+    {
+        let shared_socket_clone = shared_socket.clone();
+        tokio::spawn(async move {
+            grab_packets_and_forward(shared_socket_clone, udp_packet_tx).await;
+        });
+    }
 
-    // Terminal
+    // ---------------- Terminal UI ----------------
     let terminal_args = TerminalArgs {
         shared_socket: shared_socket.clone(),
         targets: clients.clone(),
@@ -3088,69 +3360,93 @@ async fn run_server(cli: Cli) -> anyhow::Result<()> {
     };
     tokio::spawn(async move { terminal_loop(terminal_args).await });
 
-    // File manager task
-    let chat_tx_clone = chat_tx.clone();
-    let forward_cache_clone = forward_cache.clone();
-    let progress_registry_clone = progress_registry.clone();
-    tokio::spawn(async move {
-        file_manager_task(
-            file_chunk_rx,
-            chat_tx_clone,
-            file_transfers.clone(),
-            transfer_counter.clone(),
-            redraw_notify.clone(),
-            ack_tracker.clone(),
-            forward_cache_clone,
-            progress_registry_clone,
-        )
-        .await;
-    });
-
-    // Auto-prune dead clients
-    let clients_clone = clients.clone();
-    let shared_socket_clone_opt = Some(shared_socket.clone());
-    let shutdown_flag_opt = Some(shutdown_flag.clone());
-    tokio::spawn(async move {
-        prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await;
-    });
-
-    // Receiver
-    tokio::spawn({
-        let chat_tx = chat_tx.clone();
-        let file_chunk_tx = file_chunk_tx.clone();
-        let ack_map = ack_map.clone();
-        let clients = clients.clone();
-        let targets_tx = targets_tx.clone();
+    // ---------------- File manager ----------------
+    {
+        let chat_tx_clone = chat_tx.clone();
         let forward_cache_clone = forward_cache.clone();
-        let secret = cli.secret.clone();
-        let channel_registry_clone = channel_registry.clone();
-
-        async move {
-            spawn_receiver(
-                shared_socket.clone(),
-                chat_tx.clone(),
-                file_chunk_tx.clone(),
-                ack_map.clone(),
-                progress_registry.clone(),
-                clients.clone(),
-                targets_tx.clone(),
-                true, //server
+        let progress_registry_clone = progress_registry.clone();
+        let ack_tracker_clone = ack_tracker.clone();
+        tokio::spawn(async move {
+            file_manager_task(
+                file_chunk_rx,
+                chat_tx_clone,
+                file_transfers.clone(),
+                transfer_counter.clone(),
+                redraw_notify.clone(),
+                ack_tracker_clone,
                 forward_cache_clone,
-                secret.clone(),
-                shutdown_flag.clone(),
-                channel_registry_clone.clone(),
-                udp_packet_rx,
-                base_port,
-                port_range,
+                progress_registry_clone,
             )
             .await;
-        }
-    });
-	// keep server alive
+        });
+    }
+
+    // ---------------- Auto-prune dead clients ----------------
+    {
+        let clients_clone = clients.clone();
+        let shared_socket_clone_opt = Some(shared_socket.clone());
+        let shutdown_flag_opt = Some(shutdown_flag.clone());
+        tokio::spawn(async move {
+            prune_gone_targets(true, clients_clone, shared_socket_clone_opt, None, shutdown_flag_opt).await;
+        });
+    }
+
+    // ---------------- Receiver task ----------------
+	{
+		let chat_tx = chat_tx.clone();
+		let file_chunk_tx = file_chunk_tx.clone();
+		let ack_map = ack_map.clone();
+		let clients = clients.clone();
+		let targets_tx = targets_tx.clone();
+		let forward_cache_clone = forward_cache.clone();
+		let secret = cli.secret.clone();
+		let channel_registry_clone = channel_registry.clone();
+		let progress_registry_clone = progress_registry.clone();
+		let shared_socket_clone_for_recv = shared_socket.clone();
+
+		tokio::spawn(async move {
+			spawn_receiver(
+				shared_socket_clone_for_recv,
+				chat_tx.clone(),
+				file_chunk_tx.clone(),
+				ack_map.clone(),
+				progress_registry_clone.clone(),
+				clients.clone(),
+				targets_tx.clone(),
+				true, // server
+				forward_cache_clone,
+				secret.clone(),
+				shutdown_flag.clone(),
+				channel_registry_clone.clone(),
+				udp_packet_rx,
+				base_port,
+				port_range,
+			)
+			.await;
+		});
+	}
+
+	// ---------------- Fan-out relay manager ----------------
+	{
+		let ftm = Arc::new(FileTransferManager::new(
+			shared_socket.clone(),
+			forward_cache.clone(),
+			ack_map.clone(),
+			clients.clone(),
+			progress_registry.clone(),
+			channel_registry.clone(),
+		));
+
+		ftm.clone().start(); // launches relay background loop
+	}
+
+
+    // ---------------- Keep server alive ----------------
     tokio::signal::ctrl_c().await.expect("shutdown signal failed");
-    
+
     Ok(())
 }
+
 
 
 async fn run_client(cli: Cli, server: String) {
@@ -3164,7 +3460,7 @@ async fn run_client(cli: Cli, server: String) {
     let forward_cache: ForwardCache = new_forward_cache();
     let channel_registry: AckChannelRegistry = Arc::new(RwLock::new(HashMap::new()));
 
-    // Terminal setup
+    // --- Terminal setup ---
     let (cols, _rows) = terminal::size().expect("ERROR: terminal size is weird");
     let term = Term::stderr();
     let draw_target = ProgressDrawTarget::term(term, (cols as u16).try_into().unwrap());
@@ -3172,58 +3468,57 @@ async fn run_client(cli: Cli, server: String) {
     let progress_registry = Arc::new(ProgressRegistry::new(multi_arc.clone()));
     set_global_registries(progress_registry.clone());
 
-    // UDP + shared socket
+    // --- UDP + shared socket ---
     let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await.expect("bind failed"));
     let shared_socket = Arc::new(tokio::sync::RwLock::new(socket.clone()));
     let shutdown_flag = Arc::new(AtomicBool::new(false));
 
-    // ---------------- Dual-bind rotation manager ----------------
-    use std::net::IpAddr;
-    use std::str::FromStr;
-
-    let bind_ip = IpAddr::from_str("0.0.0.0").unwrap();
+    let bind_ip = std::net::IpAddr::from_str("0.0.0.0").unwrap();
     let secret_bytes_arc = Arc::new(cli.secret.clone().into_bytes());
-
     let (udp_packet_tx, udp_packet_rx) = mpsc::channel::<UdpPacket>(8192);
 
     // ---------------- Periodic HELLO Advertiser ----------------
-	let shared_socket_hello = shared_socket.clone();
-	let secret_clone = cli.secret.clone();
-	let base_port = cli.base_port;
-	let port_range = cli.port_range;
+    let shared_socket_hello = shared_socket.clone();
+    let secret_clone = cli.secret.clone();
+    let base_port = cli.base_port;
+    let port_range = cli.port_range;
 
-	// Extract server address from Cli::Role
-	let server_host = match &cli.role {
-		Role::Client { server } => server.clone(),
-		_ => {
-			eprintln!("[HELLO] invalid role for client mode");
-			return;
-		}
-	};
+    let server_host = match &cli.role {
+        Role::Client { server } => server.clone(),
+        _ => {
+            eprintln!("[HELLO] invalid role for client mode");
+            return;
+        }
+    };
 
-	tokio::spawn(async move {
-		let secret_bytes = secret_clone.as_bytes();
+    tokio::spawn(async move {
+        let secret_bytes = secret_clone.as_bytes();
 
-		loop {
-			// Compute all valid rotation ports for the server
-			let ports = compute_synched_ports(secret_bytes, base_port, port_range, 2);
+        loop {
+            // Compute all valid rotation ports
+            let ports = compute_synched_ports(secret_bytes, base_port, port_range, 2);
+            let period = current_period_u32();
+            let seq = FILE_SEQ.fetch_add(1, Ordering::Relaxed);
 
-			for port in ports {
-				let server_sock = format!("{}:{}", server_host, port)
-					.parse::<SocketAddr>()
-					.expect("invalid server address");
+            for port in ports {
+                let server_sock = format!("{}:{}", server_host, port)
+                    .parse::<SocketAddr>()
+                    .expect("invalid server address");
 
-				if let Err(e) = send_via_shared(&shared_socket_hello, HELLO_PREFIX, server_sock).await {
-					eprintln!("[HELLO] failed to send to {}: {}", server_sock, e);
-				} else {
-					//eprintln!("[HELLO] sent to {}", server_sock);
-				}
-			}
+                // --- Build framed HELLO ---
+                let mut frame = Vec::with_capacity(16);
+                write_header(&mut frame, Kind::Hello, period, seq, 0);
 
-			// Wait before next advertise cycle
-			tokio::time::sleep(Duration::from_secs(5)).await;
-		}
-	});
+                if let Err(e) = send_via_shared(&shared_socket_hello, &frame, server_sock).await {
+                    eprintln!("[HELLO] failed to send to {}: {}", server_sock, e);
+                } else {
+                    eprintln!("[HELLO] sent to {} period={} seq={}", server_sock, period, seq);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 
     // ---------------- Terminal ----------------
     let terminal_args = TerminalArgs {
@@ -3240,9 +3535,9 @@ async fn run_client(cli: Cli, server: String) {
         chat_tx: chat_tx.clone(),
     };
     tokio::spawn(async move { terminal_loop(terminal_args).await });
-    
+
+    // ---------------- Packet Forwarder ----------------
     let shared_socket_clone = shared_socket.clone();
-    
     tokio::spawn(async move {
         grab_packets_and_forward(shared_socket_clone, udp_packet_tx).await;
     });
@@ -3268,7 +3563,7 @@ async fn run_client(cli: Cli, server: String) {
                 progress_registry_clone,
                 clients.clone(),
                 targets_tx.clone(),
-                false, //not server
+                false, // not server
                 forward_cache_clone,
                 secret.clone(),
                 shutdown_flag.clone(),
@@ -3280,8 +3575,31 @@ async fn run_client(cli: Cli, server: String) {
             .await;
         }
     });
+    
+    // ---------------- File manager ----------------
+    {
+        let chat_tx_clone = chat_tx.clone();
+        let forward_cache_clone = forward_cache.clone();
+        let progress_registry_clone = progress_registry.clone();
+        let ack_tracker_clone = ack_tracker.clone();
+        tokio::spawn(async move {
+            file_manager_task(
+                file_chunk_rx,
+                chat_tx_clone,
+                file_transfers.clone(),
+                transfer_counter.clone(),
+                redraw_notify.clone(),
+                ack_tracker_clone,
+                forward_cache_clone,
+                progress_registry_clone,
+            )
+            .await;
+        });
+    }
 
-    // keep client alive
+    
+
+    // ---------------- Keep Client Alive ----------------
     tokio::signal::ctrl_c().await.expect("shutdown signal failed");
 }
 
@@ -69082,3 +69400,12 @@ pub fn spawn_drift_receiver(mut drift_rx: mpsc::Receiver<i64>) {
         }
     });
 }
+
+
+// Receiver: handle unencrypted FileChunk frames
+async fn handle_file_chunk_frame(chunk_idx: u32, payload: &[u8]) -> Result<(), std::io::Error> {
+    // TODO: Integrate with your file assembly logic.
+    eprintln!("[FILE-RECV] chunk {} ({} bytes)", chunk_idx, payload.len());
+    Ok(())
+}
+
