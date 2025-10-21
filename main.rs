@@ -401,18 +401,20 @@ pub struct Config {
     pub tick: Duration,
     pub max_retries: usize,
     pub stall_watchdog: Duration,
+    pub probe_interval: Duration,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            chunk: 1200,
-            initial_cwnd: 8,
-            max_cwnd: 512,
-            ack_timeout: Duration::from_millis(500),
-            tick: Duration::from_micros(2_000),
-            max_retries: 25,
-            stall_watchdog: Duration::from_millis(5_000),
+            chunk: 1200, 								// DEFAULT 1200
+            initial_cwnd: 32,							// DEFAULT 32
+            max_cwnd: 256,								// DEFAULT
+            ack_timeout: Duration::from_millis(250),	// DEFAULT 250
+            tick: Duration::from_millis(20),			// DEFAULT 20
+            max_retries: 10,							// DEFAULT 10
+            stall_watchdog: Duration::from_millis(5_000), //DEFAULT 5000
+            probe_interval: Duration::from_secs(2),		// DEFAULT 2
         }
     }
 }
@@ -428,11 +430,15 @@ struct SendWindow {
     unacked: HashSet<u64>,
     last_sent: HashMap<u64, Instant>,
     retries: HashMap<u64, usize>,
+    last_probe: Instant,
 }
+
 impl SendWindow {
     fn new(total_chunks: u64, initial_cwnd: u32) -> Self {
         let mut un = HashSet::with_capacity(total_chunks as usize);
-        for i in 0..total_chunks { un.insert(i); }
+        for i in 0..total_chunks {
+            un.insert(i);
+        }
         Self {
             next_to_send: 0,
             cwnd: initial_cwnd,
@@ -441,10 +447,23 @@ impl SendWindow {
             unacked: un,
             last_sent: HashMap::new(),
             retries: HashMap::new(),
+            last_probe: Instant::now() - Duration::from_secs(3600),
         }
     }
-    fn all_done(&self) -> bool { self.unacked.is_empty() }
+
+    fn all_done(&self) -> bool {
+        self.unacked.is_empty()
+    }
+
+    fn should_probe(&self, cfg: &Config) -> bool {
+        self.cwnd == 0 || self.in_flight >= self.cwnd && self.last_probe.elapsed() > cfg.probe_interval
+    }
+
+    fn mark_probe(&mut self) {
+        self.last_probe = Instant::now();
+    }
 }
+
 
 struct Runner<'a> {
     shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
@@ -476,302 +495,245 @@ impl<'a> Runner<'a> {
     }
 
     async fn run(self) -> anyhow::Result<()> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static PROGRESS_TICKS: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROGRESS_TICKS: AtomicU64 = AtomicU64::new(0);
 
-        std::panic::set_hook(Box::new(|info| { let _ = eprintln!("\n>>> PANIC in SendFile::run: {info:?}"); }));
+    let meta = tokio::fs::metadata(self.path).await?;
+    let file_size = meta.len();
+    let std_file = std::fs::File::open(self.path)?;
+    let filename = Path::new(self.path).to_string_lossy().to_string();
+    ui_log!(self.chat_tx, "[SEND][START] file_id={} name={} size={} bytes", self.file_id, filename, file_size);
 
-        // Open & stat once
-        let meta = tokio::fs::metadata(self.path).await?;
-        let file_size = meta.len();
-        let std_file = std::fs::File::open(self.path)?;
-        let filename = Path::new(self.path).to_string_lossy().to_string();
-        ui_log!(self.chat_tx, "[SEND][START] file_id={} name={} size={} bytes", self.file_id, filename, file_size);
+    let clients: Vec<SocketAddr> = {
+        let t = self.targets.lock().await;
+        t.iter().copied().collect()
+    };
+    if clients.is_empty() {
+        ui_log!(self.chat_tx, "[ERROR] SendFile: no targets at start — aborting transfer");
+        return Ok(());
+    }
 
-        // Snapshot peers
-        let clients: Vec<SocketAddr> = {
-            let t = self.targets.lock().await; t.iter().copied().collect()
-        };
-        ui_log!(self.chat_tx, "[DEBUG] SendFile: snapshot {} peer(s)", clients.len());
-        if clients.is_empty() {
-            ui_log!(self.chat_tx, "[ERROR] SendFile: no targets at start — aborting transfer");
-            return Ok(());
-        }
+    let total_chunks = chunks_needed(file_size, self.cfg.chunk as u64)?;
+    let transfer_token: u64 = rand::random();
 
-        let total_chunks = chunks_needed(file_size, self.cfg.chunk as u64)?;
-        let transfer_token: u64 = rand::random();
+    let fa = FileAck::with_token_and_peers(transfer_token, &clients, total_chunks);
+    self.ack_map.insert(self.file_id, Arc::new(Mutex::new(fa)));
 
-        // Register progress UI structure
-        if !clients.is_empty() {
-            let fa = FileAck::with_token_and_peers(transfer_token, &clients, total_chunks);
-            self.ack_map.insert(self.file_id, Arc::new(Mutex::new(fa)));
-        }
+    let (ack_tx, mut ack_rx) = mpsc::channel::<AckPacket>(16384);
+    {
+        let mut reg = self.channel_registry.write().await;
+        reg.insert(self.file_id, ack_tx.clone());
+    }
 
-        // Per-transfer ACK broadcast and registry hookup
-        let (ack_tx, mut ack_rx) = mpsc::channel::<AckPacket>(16384);
-        {
-            let mut reg = self.channel_registry.write().await;
-            ui_log!(self.chat_tx, "[DEBUG] SendFile: registering ack_tx for file_id={} into registry", self.file_id);
-            reg.insert(self.file_id, ack_tx.clone());
-        }
+    let windows: Arc<DashMap<(u32, SocketAddr), SendWindow>> = Arc::new(DashMap::new());
+    for &peer in &clients {
+        windows.insert(
+            (self.file_id, self.fake_windows_src),
+            SendWindow::new(total_chunks, self.cfg.initial_cwnd),
+        );
+    }
+    let notify = Arc::new(Notify::new());
 
-        // Shared state: per-peer windows and notify
-        let windows: Arc<DashMap<(u32, SocketAddr), SendWindow>> = Arc::new(DashMap::new());
-        for &peer in &clients { windows.insert((self.file_id, self.fake_windows_src), SendWindow::new(total_chunks, self.cfg.initial_cwnd)); }
-        let notify = Arc::new(Notify::new());
+    let ack_loop = {
+        let windows = Arc::clone(&windows);
+        let notify = Arc::clone(&notify);
+        let ack_map = self.ack_map.clone();
+        let chat_tx = self.chat_tx.clone();
+        let file_id = self.file_id;
+        let fake_src = self.fake_windows_src;
+        let cfg = self.cfg.clone();
 
-        // Spawn ACK loop
-        ui_log!(self.chat_tx, "[DEBUG] SendFile: spawning ACK loop");
-        let ack_loop = {
-            let windows = Arc::clone(&windows);
-            let notify = Arc::clone(&notify);
-            let ack_map = self.ack_map.clone();
-            let chat_tx_for_window = self.chat_tx.clone();
-            let file_id = self.file_id;
-            tokio::spawn(async move {
-				let chat_tx_for_window_ack = chat_tx_for_window.clone();
-                let task = async move {
-                    loop {
-						//ui_log!(chat_tx_for_window_ack, "[DEBUG] SendFile: ACK loop");
-                        match ack_rx.recv().await {
-                            Some(ack) => {
-                                let mut credited = false;
-                                /*ui_log!(
-									chat_tx_for_window_ack,
-									"[DEBUG] [ACK] file_id={} chunk={} ack.src={} windows keys={:?}",
-									ack.file_id,
-									ack.chunk_index,
-									ack.src,
-									windows.iter().map(|e| e.key().1).collect::<Vec<_>>()
-								);*/
-                                if let Some(mut w) = windows.get_mut(&(ack.file_id, self.fake_windows_src)) {
-                                    let win = w.value_mut();
-                                    if win.unacked.remove(&ack.chunk_index) {
-                                        if win.in_flight > 0 { win.in_flight -= 1; }
-                                        if win.cwnd < 512 { win.cwnd += 1; }
-                                        win.last_sent.remove(&ack.chunk_index);
-                                        win.retries.remove(&ack.chunk_index);
-                                        credited = true;
-                                    }
-                                }
-                                if !credited {
-                                    if let Some(mut any_w) = windows.iter_mut().find(|e| {
-                                        let (fid, _) = *e.key(); fid == ack.file_id && e.value().unacked.contains(&ack.chunk_index)
-                                    }) {
-                                        let win = any_w.value_mut();
-                                        if win.unacked.remove(&ack.chunk_index) {
-                                            if win.in_flight > 0 { win.in_flight -= 1; }
-                                            if win.cwnd < 512 { win.cwnd += 1; }
-                                            win.last_sent.remove(&ack.chunk_index);
-                                            win.retries.remove(&ack.chunk_index);
-                                            credited = true;
-                                        }
-                                    }
-                                }
-                                if credited { PROGRESS_TICKS.fetch_add(1, Ordering::Relaxed); }
-                                if let Some(fa) = ack_map.get(&ack.file_id) {
-									let mut fa_locked = fa.lock().await;
-									fa_locked.acknowledge(ack.src, ack.chunk_index);
-
-									let done = fa_locked.per_client.values().all(|v| {
-										v.iter().all(|b| b.load(Ordering::Relaxed))
-									});
-
-									if done {
-										ui_log!(chat_tx_for_window_ack, "[ACK-HANDLER] all chunks done — suppressing premature ack_map removal");
-										
-									}
-								}
-                                notify.notify_one();
-                            }
-                            None => {
-                                continue;
-                            }
+        tokio::spawn(async move {
+            while let Some(ack) = ack_rx.recv().await {
+                let mut credited = false;
+                if let Some(mut win) = windows.get_mut(&(ack.file_id, fake_src)) {
+                    if win.unacked.remove(&ack.chunk_index) {
+                        if win.in_flight > 0 {
+                            win.in_flight -= 1;
                         }
-                        tokio::task::yield_now().await;
-                    }
-                };
-                let res = std::panic::AssertUnwindSafe(task).catch_unwind().await;
-                ui_log!(chat_tx_for_window, "[DEBUG] ACK loop exited: {:?}", res);
-                ui_log!(chat_tx_for_window, "[ACK] loop exit for file_id={}", file_id);
-            })
-        };
-
-        // Spawn pacer loop
-        ui_log!(self.chat_tx, "[DEBUG] SendFile: spawning PACER loop");
-        let pacer_loop = {
-            let windows = Arc::clone(&windows);
-            let notify = Arc::clone(&notify);
-            let shared_socket = Arc::clone(&self.shared_socket);
-            let clients = clients.clone();
-            let cfg = self.cfg.clone();
-            let chat_tx_clone = self.chat_tx.clone();
-            let filename = filename.clone();
-            let std_file = std_file.try_clone()?;
-            let file_id = self.file_id;
-            tokio::spawn(async move {
-				let chat_tx_clone_loop = chat_tx_clone.clone();
-                let task = async move {
-                    let mut tick = tokio::time::interval(cfg.tick);
-                    ui_log!(
-						chat_tx_clone_loop,
-						"[DEBUG] PACER started: ack_timeout={}ms tick={}us",
-						cfg.ack_timeout.as_millis(),
-						cfg.tick.as_micros()
-					);
-                    let timeout = cfg.ack_timeout;
-                    loop {
-                        tokio::select! {
-                            _ = tick.tick() => {},
-                            _ = notify.notified() => {},
+                        if win.cwnd < cfg.max_cwnd {
+                            win.cwnd += 1;
                         }
-                        let done = windows.iter().all(|e| {
-                            let (fid, _) = *e.key(); fid != file_id || e.value().all_done()
-                        });
-                        if done { ui_log!(chat_tx_clone_loop, "[DEBUG] PACER: all peers complete"); break; }
-
-                        let local_addr = {
-                            let guard = shared_socket.read().await; let sock = guard.clone();
-                            match sock.local_addr() { Ok(a) => a, Err(_) => continue }
-                        };
-
-                        for &peer in &clients {
-                            let Some(mut entry) = windows.get_mut(&(file_id, self.fake_windows_src)) else { continue };
-                            let win = entry.value_mut();
-
-                            // Timeouts & resends (MD)
-                            let expired: Vec<u64> = win.unacked.iter().filter_map(|&idx| {
-                                win.last_sent.get(&idx)
-                                    .and_then(|ts| (ts.elapsed() >= timeout).then_some(idx))
-                            }).collect();
-                            for idx in expired {
-                                win.ssthresh = (win.cwnd / 2).max(cfg.initial_cwnd);
-                                win.cwnd = cfg.initial_cwnd;
-                                win.last_sent.remove(&idx);
-                                let r = win.retries.entry(idx).or_insert(0);
-                                *r += 1;
-                                if *r > cfg.max_retries {
-                                    win.unacked.remove(&idx);
-                                    if win.in_flight > 0 { win.in_flight -= 1; }
-                                    ui_log!(chat_tx_clone_loop, "[SEND][DROP] fid={} idx={} peer={} (max retries)", file_id, idx, peer);
-                                } else {
-                                    if let Ok(encoded) = encode_chunk_on_demand(&std_file, file_id, transfer_token, total_chunks, &filename, idx, cfg.chunk, local_addr).await {
-                                        //ui_log!(chat_tx_clone_loop, "[DEBUG] PACER fresh: fid={} idx={} -> {}", file_id, idx, peer);
-                                        //ui_log!(chat_tx_clone_loop, "[DEBUG] PACER resend: fid={} idx={} -> {}", file_id, idx, peer);
-                                        
-                                        // Compute all valid rotation ports
-										let ports = compute_synched_ports(b"HelloWorld", 1025, 65535, 2);
-										for port in ports {
-											let server_sock = format!("{}:{}", peer.ip(), port)
-												.parse::<SocketAddr>()
-												.expect("invalid server address");
-											if let Err(e) = send_framed_chunk(&shared_socket, server_sock, &encoded).await {
-												//ui_log!(chat_tx_clone_loop, "[SEND][RESEND] fid={} idx={} peer={} err={:?}", file_id, idx, server_sock, e);
-											} else {
-												win.last_sent.insert(idx, Instant::now());
-											}
-										}
-									}
-                                }
-                            }
-                            
-                           
-
-                            // Fresh sends within cwnd budget
-                            let budget = win.cwnd.saturating_sub(win.in_flight);
-                            
-                            //ui_log!(chat_tx_clone_loop, "[PACER] cwnd={} in_flight={} budget={}", win.cwnd, win.in_flight, budget);
-                            
-                            if budget == 0 { continue; }
-                            let mut injected = 0u32;
-                            let mut idx = win.next_to_send;
-                            
-                            while injected < budget && idx < total_chunks {
-                                if win.unacked.contains(&idx) && !win.last_sent.contains_key(&idx) {
-                                    if let Ok(encoded) = encode_chunk_on_demand(&std_file, file_id, transfer_token, total_chunks, &filename, idx, cfg.chunk, local_addr).await {
-										
-										// Compute all valid rotation ports
-										let ports = compute_synched_ports(b"HelloWorld", 1025, 65535, 2);
-										for port in ports {
-											let server_sock = format!("{}:{}", peer.ip(), port)
-												.parse::<SocketAddr>()
-												.expect("invalid server address");
-											if let Err(e) = send_framed_chunk(&shared_socket, server_sock, &encoded).await {
-												//ui_log!(chat_tx_clone_loop, "[SEND][FRESH] fid={} idx={} peer={} err={:?}", file_id, idx, server_sock, e);
-											} else {
-												win.unacked.insert(idx);
-												win.in_flight += 1;
-												win.last_sent.insert(idx, Instant::now());
-												injected += 1;
-											}
-										}
-                                    }
-                                }
-                                idx += 1;
-                            }
-                            win.next_to_send = idx;
-                            
-                            tokio::task::yield_now().await;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                };
-                let res = std::panic::AssertUnwindSafe(task).catch_unwind().await;
-                ui_log!(chat_tx_clone, "[DEBUG] ACK loop exited: {:?}", res);
-                ui_log!(chat_tx_clone, "[PACER] loop exit for file_id={}", file_id);
-            })
-        };
-
-        // Wait until ALL peers finished, with progress watchdog
-        let mut last_tick = PROGRESS_TICKS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut last_progress = Instant::now();
-        loop {
-            let all_done = windows.iter().all(|e| { let (fid, _) = *e.key(); fid != self.file_id || e.value().all_done() });
-            if all_done { break; }
-
-            let tick = PROGRESS_TICKS.load(std::sync::atomic::Ordering::Relaxed);
-            if tick != last_tick { last_tick = tick; last_progress = Instant::now(); }
-            else if last_progress.elapsed() > self.cfg.stall_watchdog {
-                for mut e in windows.iter_mut() {
-                    let peer = e.key().1;
-                    let win = e.value_mut();
-                    let hopeless = win.unacked.iter().all(|idx| win.retries.get(idx).copied().unwrap_or(0) >= self.cfg.max_retries);
-                    if hopeless {
-                        ui_log!(self.chat_tx, "[SEND][PEER-DONE-NO-ACK] file={} peer={} (exhausted retries)", self.file_id, peer);
-                        win.unacked.clear();
-                        win.in_flight = 0;
+                        win.last_sent.remove(&ack.chunk_index);
+                        win.retries.remove(&ack.chunk_index);
+                        credited = true;
                     }
                 }
-                last_progress = Instant::now();
+
+                if credited {
+                    PROGRESS_TICKS.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if let Some(fa) = ack_map.get(&ack.file_id) {
+                    let mut fa = fa.lock().await;
+                    fa.acknowledge(ack.src, ack.chunk_index);
+                }
+                notify.notify_one();
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            tokio::task::yield_now().await;
+        })
+    };
+
+    let pacer_loop = {
+        let windows = Arc::clone(&windows);
+        let notify = Arc::clone(&notify);
+        let shared_socket = Arc::clone(&self.shared_socket);
+        let clients = clients.clone();
+        let cfg = self.cfg.clone();
+        let chat_tx = self.chat_tx.clone();
+        let filename = filename.clone();
+        let std_file = std_file.try_clone()?;
+        let file_id = self.file_id;
+        let fake_src = self.fake_windows_src;
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(cfg.tick);
+            let timeout = cfg.ack_timeout;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {},
+                    _ = notify.notified() => {},
+                }
+
+                if windows.iter().all(|e| e.value().all_done()) {
+                    break;
+                }
+
+                let local_addr = match shared_socket.read().await.local_addr() {
+                    Ok(addr) => addr,
+                    Err(_) => continue,
+                };
+
+                for &peer in &clients {
+                    let Some(mut entry) = windows.get_mut(&(file_id, fake_src)) else { continue };
+                    let win = entry.value_mut();
+
+                    let expired: Vec<u64> = win.unacked.iter().filter_map(|&idx| {
+                        win.last_sent.get(&idx)
+                            .and_then(|ts| (ts.elapsed() >= timeout).then_some(idx))
+                    }).collect();
+
+                    for idx in expired {
+                        win.ssthresh = (win.cwnd / 2).max(cfg.initial_cwnd);
+                        win.cwnd = cfg.initial_cwnd;
+                        win.last_sent.remove(&idx);
+                        let r = win.retries.entry(idx).or_insert(0);
+                        *r += 1;
+                        if *r > cfg.max_retries {
+                            win.unacked.remove(&idx);
+                            if win.in_flight > 0 {
+                                win.in_flight -= 1;
+                            }
+                            continue;
+                        }
+
+                        if let Ok(encoded) = encode_chunk_on_demand(&std_file, file_id, transfer_token, total_chunks, &filename, idx, cfg.chunk, local_addr).await {
+                            let ports = compute_synched_ports(b"HelloWorld", 1025, 65535, 2);
+                            for port in ports {
+                                let server_sock = format!("{}:{}", peer.ip(), port)
+                                    .parse::<SocketAddr>()
+                                    .expect("invalid server address");
+                                if send_framed_chunk(&shared_socket, server_sock, &encoded).await.is_ok() {
+                                    win.last_sent.insert(idx, Instant::now());
+                                }
+                            }
+                        }
+                    }
+
+                    let budget = win.cwnd.saturating_sub(win.in_flight);
+                    
+                    //ui_log!(chat_tx, "[PACER] cwnd={} in_flight={} budget={}", win.cwnd, win.in_flight, budget);
+                    
+                    let mut injected = 0u32;
+                    let mut idx = win.next_to_send;
+
+                    while injected < budget && idx < total_chunks {
+                        if win.unacked.contains(&idx) && !win.last_sent.contains_key(&idx) {
+                            if let Ok(encoded) = encode_chunk_on_demand(&std_file, file_id, transfer_token, total_chunks, &filename, idx, cfg.chunk, local_addr).await {
+                                let ports = compute_synched_ports(b"HelloWorld", 1025, 65535, 2);
+                                for port in ports {
+                                    let server_sock = format!("{}:{}", peer.ip(), port)
+                                        .parse::<SocketAddr>()
+                                        .expect("invalid server address");
+                                    send_framed_chunk(&shared_socket, server_sock, &encoded).await;
+                                }
+                                win.unacked.insert(idx);
+                                win.last_sent.insert(idx, Instant::now());
+                                win.in_flight += 1;
+                                injected += 1;
+                            }
+                        }
+                        idx += 1;
+                    }
+                    win.next_to_send = idx;
+
+                    if injected == 0 && win.should_probe(&cfg) {
+                        for &probe_idx in win.unacked.iter().take(1) {
+                            if let Ok(encoded) = encode_chunk_on_demand(&std_file, file_id, transfer_token, total_chunks, &filename, probe_idx, cfg.chunk, local_addr).await {
+                                let ports = compute_synched_ports(b"HelloWorld", 1025, 65535, 2);
+                                for port in ports {
+                                    let server_sock = format!("{}:{}", peer.ip(), port)
+                                        .parse::<SocketAddr>()
+                                        .expect("invalid server address");
+                                    send_framed_chunk(&shared_socket, server_sock, &encoded).await;
+                                }
+                                win.last_sent.insert(probe_idx, Instant::now());
+                                win.in_flight += 1;
+                                win.mark_probe();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let mut last_tick = PROGRESS_TICKS.load(Ordering::Relaxed);
+    let mut last_progress = Instant::now();
+    loop {
+        if windows.iter().all(|e| e.value().all_done()) {
+            break;
         }
 
-        // Join worker tasks (best effort)
-        let _ = ack_loop.await;
-        let _ = pacer_loop.await;
-
-        ui_log!(self.chat_tx, "[SEND][DONE] file_id={} total_chunks={} (upload complete)", self.file_id, total_chunks);
-        let _ = self.chat_tx.send(ChatLine::Transfer {
-            ts: chrono::Local::now(),
-            id: self.file_id,
-            filename: filename,
-            done: total_chunks,
-            total: total_chunks,
-            direction: TransferDirection::Upload,
-            state: TransferState::Done,
-        });
-
-        // Cleanup
-        {
-            let mut reg = self.channel_registry.write().await;
-            reg.remove(&self.file_id);
+        let tick = PROGRESS_TICKS.load(Ordering::Relaxed);
+        if tick != last_tick {
+            last_tick = tick;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() > self.cfg.stall_watchdog {
+            for mut e in windows.iter_mut() {
+                if e.value().unacked.iter().all(|idx| e.value().retries.get(idx).copied().unwrap_or(0) >= self.cfg.max_retries) {
+                    e.value_mut().unacked.clear();
+                    e.value_mut().in_flight = 0;
+                }
+            }
+            last_progress = Instant::now();
         }
-        self.ack_map.remove(&self.file_id);
-
-        Ok(())
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let _ = ack_loop.await;
+    let _ = pacer_loop.await;
+
+    ui_log!(self.chat_tx, "[SEND][DONE] file_id={} total_chunks={} (upload complete)", self.file_id, total_chunks);
+    let _ = self.chat_tx.send(ChatLine::Transfer {
+        ts: chrono::Local::now(),
+        id: self.file_id,
+        filename,
+        done: total_chunks,
+        total: total_chunks,
+        direction: TransferDirection::Upload,
+        state: TransferState::Done,
+    });
+
+    {
+        let mut reg = self.channel_registry.write().await;
+        reg.remove(&self.file_id);
+    }
+    self.ack_map.remove(&self.file_id);
+
+    Ok(())
+}
+
 }
 
 // --- Encoding & send helpers -------------------------------------------------
@@ -2148,7 +2110,6 @@ async fn file_manager_task(
     forward_cache: ForwardCache,
     registry: Arc<ProgressRegistry>,
 ) {
-	
     let state: Arc<Mutex<HashMap<u32, FileState>>> = Arc::new(Mutex::new(HashMap::new()));
     let completed_files: Arc<RwLock<HashSet<u32>>> = Arc::new(RwLock::new(HashSet::new()));
     let mut last_redraw = Instant::now();
@@ -2157,14 +2118,8 @@ async fn file_manager_task(
         match rx.recv().await {
             Some(chunk) => {
                 let file_id = chunk.file_id;
-                //ui_log!(chat_tx,
-                //    "[FM] chunk={} total={:?} file_id={}",
-                //    chunk.chunk_index,
-                //    chunk.total_chunks,
-                //    file_id
-                //);
 
-                // --- Skip if already completed ---
+                // Skip if already completed
                 {
                     let completed_guard = completed_files.read().await;
                     if completed_guard.contains(&file_id) {
@@ -2172,7 +2127,7 @@ async fn file_manager_task(
                     }
                 }
 
-                // --- Determine filename (or fallback) ---
+                // Determine filename
                 let filename: String = {
                     let map_lock = registry.map.lock().await;
                     if let Some(name) = map_lock.get(&file_id) {
@@ -2182,7 +2137,7 @@ async fn file_manager_task(
                     }
                 };
 
-                // --- Insert or update FileState ---
+                // Insert/update FileState
                 let mut state_guard = state.lock().await;
                 let entry = state_guard.entry(file_id).or_insert_with(|| FileState {
                     filename: filename.clone(),
@@ -2192,127 +2147,143 @@ async fn file_manager_task(
                 });
                 entry.last_seen = Instant::now();
 
-                /// --- Ensure total_chunks is initialized ---
-				if entry.total_chunks == 0 && chunk.total_chunks > 0 {
-					entry.total_chunks = chunk.total_chunks;
-				}
-				
+                if entry.total_chunks == 0 && chunk.total_chunks > 0 {
+                    entry.total_chunks = chunk.total_chunks;
+                }
+
                 if let Some(name) = &chunk.filename {
                     if entry.filename.starts_with("file_") || entry.filename != *name {
                         entry.filename = name.clone();
-                        //ui_log!(chat_tx,"[FM] filename resolved to '{}'", name);
                     }
                 }
 
-                // --- Skip duplicate chunks ---
                 if entry.chunks.contains_key(&chunk.chunk_index) {
                     drop(state_guard);
                     continue;
                 }
 
-                // --- Store payload ---
-                entry
-                    .chunks
-                    .insert(chunk.chunk_index, chunk.payload.clone());
+                entry.chunks.insert(chunk.chunk_index, chunk.payload.clone());
 
-                // Snapshot for checks after unlock
+                // Snapshot before unlock
                 let unique_received = entry.chunks.len() as u64;
-                let total_chunks_opt = entry.total_chunks;
-                let filename_known = !entry.filename.starts_with("file_");
+                let total_chunks = entry.total_chunks;
                 let file_chunks_clone = entry.chunks.clone();
                 let filename_for_write = entry.filename.clone();
+                drop(state_guard);
 
+                // --- Completion trigger ---
+                if total_chunks > 0 && unique_received == total_chunks {
+                    let mut cf = completed_files.write().await;
+                    if !cf.contains(&file_id) {
+                        cf.insert(file_id);
+                        drop(cf);
 
-                // --- Explicit completion trigger when all expected chunks received ---
-				if entry.total_chunks > 0 && unique_received as u64 == entry.total_chunks {
-					//ui_log!(chat_tx,
-					//	"[FM] file_id={} all {} chunks received, triggering finalization",
-					//	file_id, entry.total_chunks
-					//);
+                        let filename_for_spawn = filename_for_write.clone();
+                        let file_chunks_for_spawn = file_chunks_clone.clone();
+                        let file_transfers = file_transfers.clone();
+                        let chat_tx_clone = chat_tx.clone();
+                        let redraw_notify_clone = redraw_notify.clone();
+                        let total_chunks_for_spawn = total_chunks;
 
-					let mut cf = completed_files.write().await;
-					if !cf.contains(&file_id) {
-						cf.insert(file_id);
-						drop(cf);
+                        tokio::spawn(async move {
+                            // Clone again for move safety
+                            let filename_for_blocking = filename_for_spawn.clone();
+                            let file_chunks_for_blocking = file_chunks_for_spawn.clone();
 
-						// clone data for async spawn to avoid ownership moves
-						let filename_for_spawn = filename_for_write.clone();
-						let file_chunks_for_spawn = file_chunks_clone.clone();
-						let file_transfers = file_transfers.clone();
-						let chat_tx_clone = chat_tx.clone();
-						let redraw_notify = redraw_notify.clone();
+                            let write_result = tokio::task::spawn_blocking(move || {
+                                // Reassemble in correct order
+                                let mut data = Vec::new();
+                                for i in 0..total_chunks_for_spawn {
+                                    let Some(c) = file_chunks_for_blocking.get(&i) else {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            format!("missing chunk {}", i),
+                                        ));
+                                    };
+                                    data.extend_from_slice(c);
+                                }
+                                std::fs::write(&filename_for_blocking, &data)
+                            })
+                            .await;
 
-						tokio::spawn(async move {
-							// inner clone for blocking thread
-							let file_chunks_for_blocking = file_chunks_for_spawn.clone();
-							let filename_for_blocking = filename_for_spawn.clone();
+                            match write_result {
+                                Ok(Ok(())) => {
+                                    ui_log!(
+                                        chat_tx_clone,
+                                        "[RECV][DONE] file '{}' saved ({} chunks)",
+                                        filename_for_spawn,
+                                        file_chunks_for_spawn.len()
+                                    );
 
-							let write_result = tokio::task::spawn_blocking(move || {
-								let total_size: usize = file_chunks_for_blocking.values().map(|c| c.len()).sum();
-								let mut data = Vec::with_capacity(total_size);
-								for i in 0..file_chunks_for_blocking.len() as u64 {
-									if let Some(c) = file_chunks_for_blocking.get(&i) {
-										data.extend_from_slice(c);
-									}
-								}
-								std::fs::write(&filename_for_blocking, &data)
-							})
-							.await;
+                                    if let Err(e) = chat_tx_clone
+                                        .send(ChatLine::Message {
+                                            ts: chrono::Local::now(),
+                                            msg: format!(
+                                                "Saved received file '{}'",
+                                                filename_for_spawn
+                                            ),
+                                        })
+                                        .await
+                                    {
+                                        eprintln!(
+                                            "[FM] could not emit completion log for '{}': {}",
+                                            filename_for_spawn, e
+                                        );
+                                    }
 
-							if write_result.is_ok() {
-								let _ = chat_tx_clone.send(ChatLine::Message {
-									ts: chrono::Local::now(),
-									msg: format!("Saved received file '{}'", filename_for_spawn),
-								});
-								
-								redraw_notify.notify_one();
+                                    let mut ft = file_transfers.lock().await;
+                                    ft.insert(
+                                        filename_for_spawn.clone(),
+                                        (
+                                            file_chunks_for_spawn.len() as u64,
+                                            file_chunks_for_spawn.len() as u64,
+                                            TransferDirection::Download,
+                                            TransferState::Done,
+                                        ),
+                                    );
+                                    redraw_notify_clone.notify_one();
+                                }
+                                Ok(Err(ioe)) => {
+                                    ui_log!(
+                                        chat_tx_clone,
+                                        "[FM] write '{}' failed: {}",
+                                        filename_for_spawn,
+                                        ioe
+                                    );
+                                }
+                                Err(join_err) => {
+                                    ui_log!(
+                                        chat_tx_clone,
+                                        "[FM] writer task join error for '{}': {}",
+                                        filename_for_spawn,
+                                        join_err
+                                    );
+                                }
+                            }
+                        });
+                    }
+                }
 
-								let mut ft = file_transfers.lock().await;
-								ft.insert(
-									filename_for_spawn.clone(),
-									(
-										file_chunks_for_spawn.len() as u64,
-										file_chunks_for_spawn.len() as u64,
-										TransferDirection::Download,
-										TransferState::Done,
-									),
-								);
-								redraw_notify.notify_one();
-							}
-						});
-					}
-				}
-				
-				
-				//ui_log!(chat_tx,
-				//	"[FM][CHK] fid={} have={} expected={}",
-				//	file_id, unique_received, entry.total_chunks
-				//);
-				
-				drop(state_guard);
-
-
-                // --- Update ACK tracker (optional) ---
+                // Update ACK tracker (optional)
                 if let Some(_src) = &chunk.src {
                     let mut at = ack_tracker.lock().await;
                     at.entry(filename_for_write.clone());
                 }
 
-                // --- Redraw UI periodically ---
+                // Periodic redraw
                 if last_redraw.elapsed() >= Duration::from_millis(100) {
                     redraw_notify.notify_one();
                     last_redraw = Instant::now();
                 }
-			}
-
+            }
             None => {
-				// channel closed or all senders dropped
-				ui_log!(chat_tx,"[FM] channel closed — exiting");
-				break;
-			}
+                ui_log!(chat_tx, "[FM] channel closed — exiting");
+                break;
+            }
         }
     }
 }
+
 
 /*fn chunks_needed(file_size: u64, chunk_size: u64) -> Result<u64, &'static str> {
     if chunk_size == 0 {
@@ -3043,145 +3014,68 @@ pub async fn try_handle_chat(
 /// but separates `real_peer` tracking for accurate FileAck state.
 pub async fn try_handle_ack(
     packet: UdpPacket,
-    src_addr: SocketAddr,                    // real network sender of the ACK
+    src_addr: SocketAddr,
     ack_map: Arc<DashMap<u32, Arc<Mutex<FileAck>>>>,
     channel_registry: AckChannelRegistry,
     registry: Arc<ProgressRegistry>,
-    shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
-    targets: &Arc<Mutex<HashSet<SocketAddr>>>,
+    _shared_socket: Arc<RwLock<Arc<UdpSocket>>>,
+    _targets: &Arc<Mutex<HashSet<SocketAddr>>>,
     chat_tx: mpsc::Sender<ChatLine>,
-    windows_fake_src: SocketAddr,            // spoofed src for sender window key
+    windows_fake_src: SocketAddr,
 ) -> bool {
-    // --- Parse ACK ---
     let mut ack = match AckPacket::from_bytes(&packet.payload) {
         Some(a) => a,
         None => {
-            ui_log!(chat_tx, "[ACK-HANDLER] malformed from {}", src_addr);
+            ui_log!(chat_tx, "[ACK-HANDLER] malformed ACK from {}", src_addr);
             return false;
         }
     };
 
-    // Save real and spoofed identity separately
     let real_peer = src_addr;
-    ack.src = windows_fake_src; // keep spoof for sender fast-path window match
-    
-    let has_window = ack_map.get(&ack.file_id).is_some();
-	if !has_window {
-		ui_log!(chat_tx, "[ACK-HANDLER] ignoring premature ACK for file_id={}", ack.file_id);
-		return false;
-	}
-	
-	// SMALL TIMER TO MIMIC NETWORK CONDITIONS
+    ack.src = windows_fake_src;
+
+    let Some(entry) = ack_map.get(&ack.file_id) else {
+        ui_log!(
+            chat_tx,
+            "[ACK-HANDLER] ignoring unknown file_id={} from {}",
+            ack.file_id,
+            real_peer
+        );
+        return false;
+    };
+
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-
-    // --- Forward ACK into the correct sender-side channel ---
     if let Some(tx) = {
         let reg = channel_registry.read().await;
         reg.get(&ack.file_id).cloned()
     } {
-        //ui_log!(chat_tx, "[DEBUG] Sending ACK to registered ack_tx...");
-
-        match tx.send(ack.clone()).await {
-			Ok(()) => {
-				/*ui_log!(
-					chat_tx,
-					"[ACK-HANDLER] forwarded ack: file_id={} chunk={} (queued to receiver)",
-					ack.file_id,
-					ack.chunk_index
-				);*/
-			}
-			Err(e) => {
-				ui_log!(
-					chat_tx,
-					"[ACK-HANDLER][SEND-ERR] file_id={} chunk={} err={:?}",
-					ack.file_id,
-					ack.chunk_index,
-					e
-				);
-			}
-		}
-
-        /*ui_log!(
-            chat_tx,
-            "[ACK-HANDLER] forwarded ack: file_id={} chunk={} to send_file",
-            ack.file_id,
-            ack.chunk_index
-        );*/
+        if let Err(e) = tx.send(ack.clone()).await {
+            ui_log!(
+                chat_tx,
+                "[ACK-HANDLER][SEND-ERR] file_id={} chunk={} err={:?}",
+                ack.file_id,
+                ack.chunk_index,
+                e
+            );
+        }
     }
-    
-    // --- Update FileAck state using the real peer address ---
-    let entry = ack_map.entry(ack.file_id).or_insert_with(|| {
-        let peers_snapshot: Vec<SocketAddr> = {
-            let lock = targets.blocking_lock();
-            lock.iter().copied().collect()
-        };
-        Arc::new(Mutex::new(FileAck::with_token_and_peers(
-            ack.transfer_token,
-            &peers_snapshot,
-            ack.total_chunks,
-        )))
-    });
 
+    // ---- Progress update via FileAck ----
     let mut fa = entry.lock().await;
-    let total_chunks_now = fa.total_chunks;
-    let chunk_index = ack.chunk_index;
+    let was_new = fa.acknowledge(real_peer, ack.chunk_index);
 
-    // Ensure per-client vector exists for the *real* peer
-    if !fa.per_client.contains_key(&real_peer) {
-        let len = (total_chunks_now.max(chunk_index + 1)) as usize;
-        let mut v = Vec::with_capacity(len);
-        for _ in 0..len {
-            v.push(AtomicBool::new(false));
-        }
-        fa.per_client.insert(real_peer, v);
-        ui_log!(chat_tx, "[ACK-HANDLER] created new per_client entry for {}", real_peer);
+    if was_new {
+        registry
+            .update_progress(ack.file_id, fa.total_ack_count() as u64)
+            .await;
     }
-
-    // Resize if necessary
-    {
-        let entry = fa.per_client.get_mut(&real_peer).unwrap();
-        let need = (chunk_index as usize + 1).saturating_sub(entry.len());
-        if need > 0 {
-            entry.reserve(need);
-            for _ in 0..need {
-                entry.push(AtomicBool::new(false));
-            }
-        }
-    }
-
-    fa.total_chunks = fa.total_chunks.max(chunk_index + 1);
-
-    // Mark this chunk acknowledged for the real peer
-    if let Some(entry) = fa.per_client.get_mut(&real_peer) {
-        let flag = &entry[chunk_index as usize];
-        let was_new = !flag.swap(true, Ordering::Relaxed);
-        if was_new {
-            fa.total_unique_acks.fetch_add(1, Ordering::Relaxed);
-            registry
-                .update_progress(ack.file_id, fa.total_ack_count() as u64)
-                .await;
-        }
-    }
-
-    //fa.last_addr = real_peer;
-
-    // Clean up once everyone is done
-    //if (fa.total_ack_count() as u64)
-    //    >= (fa.total_chunks * fa.per_client.len() as u64)
-    //{
-    //    ui_log!(
-    //        chat_tx,
-    //        "[ACK-HANDLER] all peers finished file_id={} removing from ack_map",
-    //        ack.file_id
-    //    );
-    //    drop(fa);
-    //    ack_map.remove(&ack.file_id);
-    //    registry.remove(ack.file_id).await;
-    //}
 
     true
 }
+
+
+
 
 
 
